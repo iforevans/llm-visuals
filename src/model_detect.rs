@@ -647,14 +647,20 @@ pub fn detect_models() -> Vec<DetectedModel> {
             if parsed.port.is_none() {
                 parsed.port = Some(crate::mlx::DEFAULT_PORT);
             }
-            if let Some((id, ctx)) = crate::mlx::served_model_blocking(
+            if let Some(served) = crate::mlx::served_model_blocking(
                 &parsed.host,
                 parsed.port,
                 std::time::Duration::from_millis(300),
             ) {
-                parsed.name = id;
-                if ctx > 0 {
-                    parsed.ctx_max = Some(ctx);
+                parsed.name = served.id;
+                if served.ctx > 0 {
+                    parsed.ctx_max = Some(served.ctx);
+                }
+                if served.mtp {
+                    // The weights carry MTP layers and the engine says they
+                    // are available; the panel title comes from this when
+                    // the metrics carry no speculative counters of their own.
+                    parsed.spec_type = Some("mtp".to_string());
                 }
             }
         }

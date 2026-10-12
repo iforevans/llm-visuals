@@ -192,6 +192,10 @@ pub struct PerfTracker {
     /// Smoothed rates for the big numerals.
     pub decode_tps_smooth: f32,
     pub prefill_tps_smooth: f32,
+    /// The displayed prefill rate is an in-flight reading from the engine's
+    /// own step counter (mlx-serve), not the completion-window mean. The
+    /// panels tag it "live" while mlx::LiveRates reports it.
+    pub prefill_rate_live: bool,
     pub peak_decode_tps: f32,
     pub peak_prefill_tps: f32,
     pub decode_hist: VecDeque<f32>,
@@ -563,6 +567,7 @@ impl PerfTracker {
             prefill_tps: 0.0,
             decode_tps_smooth: 0.0,
             prefill_tps_smooth: 0.0,
+            prefill_rate_live: false,
             peak_decode_tps: 0.0,
             peak_prefill_tps: 0.0,
             decode_hist: VecDeque::with_capacity(HISTORY),
@@ -775,6 +780,7 @@ impl PerfTracker {
         };
         self.decode_tps_smooth = ema(self.decode_tps_smooth, self.decode_tps, 0.5, 0.25);
         self.prefill_tps_smooth = ema(self.prefill_tps_smooth, self.prefill_tps, 0.5, 0.25);
+        self.prefill_rate_live = s.processing && s.prefill_rate_live;
         if self.decode_tps_smooth < 0.05 {
             self.decode_tps_smooth = 0.0;
         }

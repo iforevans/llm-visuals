@@ -504,7 +504,11 @@ impl Renderer {
             .or_else(|| p.history.back().and_then(|r| r.ttft()));
         let right_stats = [
             (
-                "prefill",
+                if p.prefill_rate_live {
+                    "prefill live"
+                } else {
+                    "prefill"
+                },
                 format!("{} tok/s", fmt_rate(p.prefill_tps_smooth)),
                 pal::MAGENTA,
             ),
@@ -2816,8 +2820,13 @@ impl Renderer {
                 Span::styled(v, Style::default().fg(pal::c(col))),
             ])
         };
+        let prefill_key = if p.prefill_rate_live {
+            "prefill live"
+        } else {
+            "prefill"
+        };
         lines.push(kv(
-            "prefill",
+            prefill_key,
             format!("{} tok/s", fmt_rate(p.prefill_tps_smooth)),
             pal::MAGENTA,
         ));

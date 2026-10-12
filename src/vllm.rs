@@ -326,6 +326,7 @@ impl VllmAdapter {
             prompt_tokens: prompt_req + cached_req,
             prompt_processed: prompt_req,
             prefill_tps: None,
+            prefill_rate_live: false,
             prefill_secs: None,
             decoded: decoded_req,
             decoded_present: true,

@@ -408,6 +408,10 @@ async fn poll_server(
         // another model's counters — decays the slot to idle and backs
         // off, instead of freezing the UI mid-request at full poll rate.
         let mut adapter = vllm::VllmAdapter::new();
+        // mlx only: the live-gauge rate tracker feeding in-flight token
+        // counts the completion-driven counters cannot show. It carries the
+        // MTP identity detection read from the engine's /v1/models.
+        let mut live_rates = mlx::live_rates(model.spec_type.as_deref() == Some("mtp"));
         let mut misses = 0u32;
         // NInfer reports its context limit. Without --max-context it runs
         // at the server's default, which the command line cannot tell.
@@ -415,17 +419,26 @@ async fn poll_server(
         let mut ctx_max = model.ctx_max.unwrap_or(0);
         loop {
             let counters = match model.engine.as_str() {
-                "ninfer" => ninfer::poll(&model.host, port, &model.name, &others, &auth).await,
-                "mlx" => mlx::poll(&model.host, port, &model.name, &others, &auth).await,
-                _ => vllm::poll_vllm(&model.host, port, &model.name, &others, &auth).await,
+                "mlx" => mlx::poll(&model.host, port, &model.name, &others, &auth)
+                    .await
+                    .map(|(c, g)| {
+                        let (mut s, spec) = adapter.observe(&c);
+                        if c.max_context > 0 {
+                            ctx_max = c.max_context;
+                        }
+                        s.ctx_max = ctx_max;
+                        live_rates.observe(&c, &g, &mut s);
+                        (s, spec)
+                    }),
+                "ninfer" => ninfer::poll(&model.host, port, &model.name, &others, &auth)
+                    .await
+                    .map(|c| adapter.observe(&c)),
+                _ => vllm::poll_vllm(&model.host, port, &model.name, &others, &auth)
+                    .await
+                    .map(|c| adapter.observe(&c)),
             };
-            if let Some(c) = counters {
+            if let Some((stats, spec)) = counters {
                 misses = 0;
-                let (mut stats, spec) = adapter.observe(&c);
-                if c.max_context > 0 {
-                    ctx_max = c.max_context;
-                }
-                stats.ctx_max = ctx_max;
                 let _ = live_tx.try_send((model.key(), stats));
                 if let Some(m) = spec {
                     let _ = spec_tx.try_send((model.key(), m));

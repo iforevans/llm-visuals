@@ -86,6 +86,11 @@ pub struct LiveStats {
     /// Engine-measured prefill throughput. Some(0) suppresses rates inferred
     /// from chunked progress or positions belonging to a cached prefix.
     pub prefill_tps: Option<f32>,
+    /// The in-flight in: `prefill_tps` is a live per-poll reading from an
+    /// engine step counter (mlx-serve's `prefill_tokens_total` movement),
+    /// not the windowed mean perf.rs infers from completion counters.
+    /// Set by mlx::LiveRates; the prefill panel tags its rate with this.
+    pub prefill_rate_live: bool,
     /// Completed request's prompt-processing duration. When present,
     /// prompt_processed is the authoritative uncached token count.
     pub prefill_secs: Option<f64>,
@@ -435,6 +440,7 @@ pub fn parse_slots(body: &str) -> Option<LiveStats> {
         prompt_tokens: u("n_prompt_tokens"),
         prompt_processed: u("n_prompt_tokens_processed"),
         prefill_tps: None,
+        prefill_rate_live: false,
         prefill_secs: None,
         decoded,
         decoded_present,
