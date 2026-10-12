@@ -46,12 +46,23 @@ impl StrataRequest {
     fn closing(&self) -> ClosingRequest {
         let cached = self.reused.min(self.prompt_tokens);
         ClosingRequest {
+            // Strata's close is built from the *finished* request's record on
+            // an idle scrape; the live stats carry the same task id there.
+            id_task: -1,
             prompt: cached + self.uncached_tokens(),
             cached,
             gen: self.output_tokens,
             prefill_secs: Some(self.prompt_ms / 1000.0),
+            measured_prefill_tps: None,
+            measured_decode_tps: None,
             ttft_secs: self.prompt_ms / 1000.0,
             itl_sum: self.decode_ms / 1000.0,
+            published_prompt: 0,
+            published_gen: 0,
+            published_completions: 0,
+            span_known: 0,
+            exact_prompt: 0,
+            exact_gen: 0,
         }
     }
 }

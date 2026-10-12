@@ -94,6 +94,15 @@ pub struct LiveStats {
     /// Completed request's prompt-processing duration. When present,
     /// prompt_processed is the authoritative uncached token count.
     pub prefill_secs: Option<f64>,
+    /// Engine-published whole-request prefill mean (mlx-serve): tokens and
+    /// seconds both come from the engine's own step counter and window, so
+    /// the rate panel prefers it to any prompt-delta ÷ TTFT reconstruction.
+    pub measured_prefill_tps: Option<f32>,
+    /// Engine-derived whole-request decode mean (mlx-serve): the decode
+    /// span is TTFT minus the measured prefill span — mlx publishes no ITL
+    /// histogram and its token counters move only at completion, so every
+    /// other decode estimate is a poll artefact.
+    pub measured_decode_tps: Option<f32>,
     pub decoded: usize,
     /// False when this `/slots` sample omitted `n_decoded`. A missing field
     /// is not a real zero: recent llama.cpp dev builds leave it out while
@@ -122,6 +131,33 @@ pub struct LiveStats {
     /// request's whole decode span, not a mean gap — the decode rate is
     /// `(decoded - 1) / itl_sum`. Always 0.0 on llama.cpp.
     pub itl_sum: f64,
+
+    /// The in-flight request's exact prompt size, from the engine's
+    /// per-request histogram (`vllm:request_prompt_tokens_sum`): it moves
+    /// only when a request completes, and then credits that request's
+    /// whole prompt — the count names it when exactly one completion
+    /// lands in the window. Unlike the running totals these sums cannot
+    /// straddle foreign requests' movement, so a record's inflated spans
+    /// and any rate above `exact_prompt / ttft` read back through them.
+    /// 0 while no completion has landed (and on servers that publish no
+    /// such histogram).
+    pub exact_prompt: u64,
+    /// The same histogram's generation-token sum for the request whose
+    /// completion landed (see `exact_prompt`).
+    pub exact_gen: u64,
+    /// The whole-token counters' movement since the previous scrape
+    /// (`vllm:prompt_tokens_total`): mlx credits a request's *whole*
+    /// prompt to this counter in one block at its completion — prefix
+    /// cache included, nothing foreign — so a scrape that moves the
+    /// completion count by exactly one names the finished request's exact
+    /// prompt through this delta. Unlike `exact_prompt` (the per-request
+    /// histogram, which a busy server's foreign completions can also move)
+    /// this reading belongs to the adapter's own two-scrape window and
+    /// cannot absorb another request's sizes. 0 when the counters held.
+    pub published_prompt: u64,
+    /// `generation_tokens_total`'s movement over the same one-scrape window:
+    /// the finished request's exact generation size.
+    pub published_gen: u64,
 
     /// The finishing request's full counters (vLLM or Strata). Set on the poll
     /// where a completion and a successor's admission share one scrape:
@@ -196,10 +232,64 @@ pub struct ClosingRequest {
     pub gen: usize,
     /// Strata's prompt-processing duration, separate from polling intervals.
     pub prefill_secs: Option<f64>,
+    /// Mlx's whole-request prefill span (TTFT), stamped by `LiveRates` on
+    /// the completion scrape: the engine's `prompt_tokens_total` carries
+    /// every other request's prefix-cache restores, so perf's measured
+    /// `tokens / TTFT` path must divide the engine-published prefill size,
+    /// not the adapter's inflated span.
+    pub measured_prefill_tps: Option<f32>,
+    /// Mlx's whole-request decode span, derived by `LiveRates` as
+    /// `TTFT delta - prefill span`: mlx-serve publishes no ITL histogram,
+    /// and the vllm counters move only at completion, so perf's poll-window
+    /// decode rate would divide the request's whole token count by one poll
+    /// interval. The engine's own two spans are exact; this one wins.
+    pub measured_decode_tps: Option<f32>,
     /// Server-measured TTFT (mean over the window's completions).
     pub ttft_secs: f64,
     /// Sum of per-request inter-token latencies (see LiveStats).
     pub itl_sum: f64,
+    /// The prompt tokens the engine itself counted for this request
+    /// (`vllm:request_prompt_tokens_sum`): under continuous batching the
+    /// adapter's prompt-counter delta can straddle two requests, whose
+    /// summed size is bigger than any single request's. A windowed rate
+    /// that would print beyond `prompt / ttft` — the biggest rate these
+    /// counters can honestly produce — is reading that straddle, and the
+    /// exact per-request counters correct it. 0 when the server publishes
+    /// no per-request histogram (or nothing moved this window).
+    pub exact_prompt: u64,
+    /// The generation tokens the same per-request histogram credits to
+    /// this request.
+    pub exact_gen: u64,
+    /// The whole-token counters' delta across the close's completion win-
+    /// dow (the adapter's scrape before the completion's, through the
+    /// completion's): mlx credits a request's whole prompt and generation
+    /// sizes there in one block, cache restores included, and nothing else
+    /// rides the ledger. The spans the printed row takes on a busy server.
+    pub published_prompt: u64,
+    /// See `published_gen`.
+    pub published_gen: u64,
+    /// How many completions the close's window straddled (the completion
+    /// count's movement across it). Exactly one means the whole-token
+    /// ledger moved for a single request, and the close's spans can be read
+    /// back through them; more (or none — strata's close, a vLLM window
+    /// with no counter edge) means the movement credits no single request.
+    pub published_completions: u64,
+    /// The request this close names, as the engine's live gauges published
+    /// it: its whole prompt (fresh expectation plus cache-restored live
+    /// progress). The adapter stamps it where the engine speaks (mlx) and
+    /// only on a close it has identified; other engines leave 0 = unknown,
+    /// which means *unbounded*. Perf's open record refuses any span that
+    /// outruns the span its own request published.
+    pub span_known: u64,
+    /// The task this close names: the adapter's task sequence when the
+    /// close was built. A completion whose scrape shows a *successor*
+    /// already lit produces a close for the finished task while the
+    /// panels' open record belongs to the new one — an adapter that
+    /// re-anchors its task number before the completion lands produces
+    /// exactly this mismatch (the flood's 22,440-token row: a request
+    /// record of task N+1 wearing task N's spans). Rescue paths key on
+    /// it; rate ceilings do not.
+    pub id_task: i64,
 }
 
 impl LiveStats {
@@ -442,6 +532,8 @@ pub fn parse_slots(body: &str) -> Option<LiveStats> {
         prefill_tps: None,
         prefill_rate_live: false,
         prefill_secs: None,
+        measured_prefill_tps: None,
+        measured_decode_tps: None,
         decoded,
         decoded_present,
         cache_tokens: u("n_prompt_tokens_cache"),
@@ -454,6 +546,11 @@ pub fn parse_slots(body: &str) -> Option<LiveStats> {
         // llama.cpp exposes no server-side timing histograms.
         ttft_secs: 0.0,
         itl_sum: 0.0,
+        // No per-request token histograms on this server.
+        published_prompt: 0,
+        published_gen: 0,
+        exact_prompt: 0,
+        exact_gen: 0,
         closing: None,
         cache_unknown: false,
         weight_gb: None,

@@ -427,7 +427,7 @@ async fn poll_server(
                             ctx_max = c.max_context;
                         }
                         s.ctx_max = ctx_max;
-                        live_rates.observe(&c, &g, &mut s);
+                        live_rates.observe(&c, &g, &mut s, &mut adapter);
                         (s, spec)
                     }),
                 "ninfer" => ninfer::poll(&model.host, port, &model.name, &others, &auth)

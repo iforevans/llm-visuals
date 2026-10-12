@@ -34,6 +34,11 @@ pub struct RequestRecord {
     pub prefill_secs: f32,
     /// Engine-measured prefill mean, preferred to polling estimates.
     pub measured_prefill_tps: Option<f32>,
+    /// Engine-derived whole-request decode mean (mlx-serve: the span is
+    /// TTFT minus the measured prefill span). Beats the poll-sum decode
+    /// rate: mlx's counters move only at completion, so every poll-based
+    /// decode rate for it is `whole request / one poll interval`.
+    pub measured_decode_tps: Option<f32>,
     pub decode_secs: f32,
     pub peak_decode_tps: f32,
 }
@@ -53,6 +58,7 @@ impl RequestRecord {
             prefill_tokens: 0,
             prefill_secs: 0.0,
             measured_prefill_tps: None,
+            measured_decode_tps: None,
             decode_secs: 0.0,
             peak_decode_tps: 0.0,
         }
@@ -74,6 +80,11 @@ impl RequestRecord {
     }
 
     pub fn avg_decode_tps(&self) -> f32 {
+        // Mlx's engine-derived mean wins: the engine published the span
+        // (TTFT minus its measured prefill), so both numerators are exact.
+        if let Some(rate) = self.measured_decode_tps {
+            return rate;
+        }
         // The server-measured decode span (vLLM ITL histogram) wins
         // over the poll-interval sum, which only counts the polls that
         // happened to carry a new token.
@@ -94,6 +105,11 @@ impl RequestRecord {
 
     pub fn avg_prefill_tps(&self) -> f32 {
         if let Some(rate) = self.measured_prefill_tps {
+            // Mlx's engine-published mean: exact numerator (the step
+            // counter's whole-window movement) and denominator (the
+            // window's span), so it wins over prompt-delta / TTFT —
+            // mlx's prompt counter credits this request with every
+            // request's prefix-cache restores.
             return rate;
         }
         // The server-measured TTFT (vLLM) is the true prefill duration
@@ -656,16 +672,120 @@ impl PerfTracker {
             || (s.processing && s.decoded < prev.decoded);
         if new_request && s.processing {
             if let Some(mut done) = self.current.take() {
-                // vLLM moves its counters only at completion, so when a
-                // completion and a successor's admission share one poll
-                // the record above was starved of the finished request's
-                // counters — restore them from the closing view the
-                // adapter captured before re-anchoring.
+                // A record with no spans of its own (mlx: the completion's
+                // counters moved on a scrape between polls, so the record
+                // never saw its tokens move) is filled entirely by the
+                // closing view: the engine's exact spans replace the poll
+                // arithmetic that would otherwise divide the request's whole
+                // token count by one poll interval. A record that *did*
+                // observe its own traffic (strata's live reads) keeps those
+                // counts; the closing view only tops up rates there.
                 if let Some(close) = s.closing.as_ref() {
-                    if done.prefill_tokens == 0 && done.decoded == 0 {
-                        done.prompt_tokens = close.prompt;
-                        done.cached_tokens = close.cached;
-                        done.prefill_tokens = close.prompt.saturating_sub(close.cached);
+                    // The closing view's spans come from the adapter's
+                    // whole-counter window, which a busy server inflates
+                    // with other requests' prefix-cache restores; its
+                    // *exact pair* — the per-request histograms the engine
+                    // credits at completion — names the finished request
+                    // alone. So the pair is the final word on the spans:
+                    // whether or not the record watched any of its own
+                    // traffic (mlx's counters freeze until completion, so
+                    // it usually watches none), the row reads through the
+                    // exact counts and the session tally follows the
+                    // substitution. Strata publishes no exact pair and is
+                    // served by the `prefill_secs` path below.
+                    // Two exact ledgers, one precedence: the whole-token
+                    // pair (`published_prompt`) is the adapter's own two-
+                    // scrape delta — mlx credits a request's whole prompt
+                    // there in one block at its completion and nothing
+                    // foreign rides that ledger (the prefix-cache flood
+                    // moves `cached_tokens_total`, a different counter).
+                    // The per-request histogram pair (`exact_prompt`) is
+                    // finer but shared: foreign completions move it too,
+                    // and the adapter has already refused it — reads 0 —
+                    // when a window was dishonest. Whichever ledger names
+                    // the finished request sets the spans.
+                    // The whole-counter window is only a single request's
+                    // ledger when exactly one completion moved it. A close
+                    // that absorbed no completion (strata's: its engine's
+                    // completion count moved across someone else's window)
+                    // credits nothing, and a window whose span outruns the
+                    // request's published size absorbed other requests'
+                    // publications (the flood's 12,070 where 9,698
+                    // belonged — the churner's spans land between the
+                    // adapter's scrapes). A *smaller* window with one
+                    // completion is chunked prefill: the engine published
+                    // all of it, so the exact ledgers read through.
+                    let one_completion = close.published_completions == 1;
+                    // Strata names no published pair and its engine gives
+                    // no completion count (both read 0); its close carries
+                    // the exact `prefill_secs` span which is honest
+                    // whatever the window watched, so a strata close names
+                    // its request through the span path.
+                    let honest_close = one_completion || close.published_completions == 0;
+                    // The published-span ceiling applies to the closing
+                    // view too: a close built across the adapter's blind
+                    // scrape carries the flood's movement in its spans.
+                    // (Its measured rates are its own — a live-rate model
+                    // never divided the flood by a span it did not publish.)
+                    let close_prompt =
+                        if close.span_known > 0 && close.prompt > close.span_known as usize {
+                            close.span_known as usize
+                        } else {
+                            close.prompt
+                        };
+                    // The exact pair names the finished request only when
+                    // the close moved the per-request histograms by exactly
+                    // one completion; the published pair (the adapter's own
+                    // two-scrape bracket) names it across the same window.
+                    // Whichever ledger speaks sets the spans, and every
+                    // span the record ends with passes the published-span
+                    // ceiling: the engine named this request's prompt
+                    // whole, an adapter view that outruns it divided the
+                    // flood, not the request.
+                    let named = if close.exact_prompt > 0 {
+                        close.exact_prompt.min(close_prompt as u64)
+                    } else if close.published_prompt > 0 && one_completion {
+                        close.published_prompt.min(close_prompt as u64)
+                    } else {
+                        0
+                    };
+                    let named_gen = if close.exact_gen > 0 {
+                        close.exact_gen
+                    } else {
+                        close.published_gen
+                    };
+                    let named_pre = named.saturating_sub(close.cached as u64);
+                    if named > 0 {
+                        // An exact ledger names the finished request's
+                        // sizes: the row reads through it, whatever the
+                        // record watched through the whole-counter window.
+                        if done.prompt_tokens != named as usize {
+                            self.session_prefilled = self
+                                .session_prefilled
+                                .saturating_sub(done.prefill_tokens as u64)
+                                .saturating_add(named_pre);
+                            done.prompt_tokens = named as usize;
+                            done.cached_tokens = close.cached;
+                            done.prefill_tokens = named_pre as usize;
+                        }
+                        if named_gen > 0 && done.decoded != named_gen as usize {
+                            self.session_decoded = self
+                                .session_decoded
+                                .saturating_sub(done.decoded as u64)
+                                .saturating_add(named_gen);
+                            done.decoded = named_gen as usize;
+                        }
+                    } else if done.prefill_tokens <= 1 && done.decoded == 0 {
+                        // No ledger named the request (plain vLLM publishes
+                        // none; on mlx the adapter refused them — a batch
+                        // of completions, or a publication between scrapes)
+                        // and the record watched none of its own traffic:
+                        // the closing view's spans, under the ceiling, are
+                        // the record's whole request — the shape this
+                        // rescue was written for.
+                        done.prompt_tokens = close_prompt;
+                        done.cached_tokens = close.cached.min(close_prompt);
+                        done.prefill_tokens = close_prompt.saturating_sub(close.cached);
                         done.decoded = close.gen;
                         if close.ttft_secs > 0.0 {
                             done.ttft = Some(close.ttft_secs as f32);
@@ -673,51 +793,125 @@ impl PerfTracker {
                         if close.itl_sum > 0.0 {
                             done.itl_sum = Some(close.itl_sum as f32);
                         }
-                        // The closing poll re-anchored the baselines,
-                        // so its deltas were 0 — bill the rescued
-                        // counters to the session totals explicitly.
+                        // The closing poll re-anchored the baselines, so
+                        // its deltas were 0 — bill the rescued counters to
+                        // the session totals explicitly.
                         self.session_prefilled += done.prefill_tokens as u64;
                         self.session_decoded += done.decoded as u64;
-                    }
-                    if let Some(secs) = close.prefill_secs {
-                        // Strata's live read position includes cached tokens.
-                        // Replace those estimates with the final engine count
-                        // even when this request already had live samples.
-                        let tokens = close.prompt.saturating_sub(close.cached);
-                        self.session_prefilled = self
-                            .session_prefilled
-                            .saturating_sub(done.prefill_tokens as u64)
-                            .saturating_add(tokens as u64);
-                        self.session_decoded += close.gen.saturating_sub(done.decoded) as u64;
-                        done.prompt_tokens = close.prompt;
-                        done.cached_tokens = close.cached;
-                        done.decoded = done.decoded.max(close.gen);
-                        done.set_prefill_timing(tokens, secs);
-                        if close.ttft_secs > 0.0 {
-                            done.ttft = Some(close.ttft_secs as f32);
+                    } else if close_prompt > done.prompt_tokens && close_prompt > s.prompt_processed
+                    {
+                        // The published-span fallback: neither ledger named
+                        // the request, but the close's window outruns the
+                        // span the record's request published — the excess
+                        // is other requests' publications the adapter's
+                        // blind scrape absorbed. Read the row back through
+                        // the published size.
+                        done.prompt_tokens = s.prompt_processed;
+                        done.cached_tokens = done.cached_tokens.min(done.prompt_tokens);
+                        done.prefill_tokens = done.prompt_tokens - done.cached_tokens;
+                        if close.gen > done.decoded {
+                            self.session_decoded += (close.gen - done.decoded) as u64;
+                            done.decoded = close.gen;
                         }
-                        if close.itl_sum > 0.0 {
-                            done.itl_sum = Some(close.itl_sum as f32);
+                        self.session_prefilled += done.prefill_tokens as u64;
+                    }
+                    // Engine-measured spans ride the close whatever the
+                    // ledger that named the sizes. Identity, the same
+                    // rule the in-loop stamps use: a close built on the
+                    // busy completion edge names the successor's task (the
+                    // finished request keeps its record's id), and the
+                    // finished row's rescue still owns this close's rates —
+                    // the adapter staged them for the request it closed.
+                    if honest_close {
+                        // Strata's exact span, whole spans, and the
+                        // engine's measured rates ride the finished
+                        // record whatever ledger set its sizes: the close
+                        // is built from the engine's own record of the
+                        // *finished* request, so its spans are exact and
+                        // the window's readings were estimates. The
+                        // session tally follows the substitution.
+                        if let Some(secs) = close.prefill_secs {
+                            let tokens = close_prompt.saturating_sub(close.cached);
+                            self.session_prefilled = self
+                                .session_prefilled
+                                .saturating_sub(done.prefill_tokens as u64)
+                                .saturating_add(tokens as u64);
+                            self.session_decoded += close.gen.saturating_sub(done.decoded) as u64;
+                            done.prompt_tokens = close_prompt;
+                            done.cached_tokens = close.cached.min(close_prompt);
+                            done.decoded = done.decoded.max(close.gen);
+                            done.set_prefill_timing(tokens, secs);
+                        }
+                        if let Some(rate) = close.measured_prefill_tps {
+                            done.measured_prefill_tps = Some(rate);
+                        }
+                        if let Some(rate) = close.measured_decode_tps {
+                            done.measured_decode_tps = Some(rate);
                         }
                     }
-                    // The detection stamps can lag a busy server
-                    // (vLLM's /metrics handler only answers between
-                    // event-loop work), so backdate `started` to the
-                    // server's own timeline: TTFT + total inter-token
-                    // time spans admission -> last token. `ended`
-                    // keeps the detection time.
-                    if done.ttft.map_or(false, |t| t > 0.0) {
-                        let e2e = close.ttft_secs + close.itl_sum;
-                        if let Some(st) = now.checked_sub(Duration::from_secs_f64(e2e)) {
-                            done.started = st;
+                    if let Some(rate) = close.measured_prefill_tps {
+                        done.measured_prefill_tps = Some(rate);
+                    }
+                    if let Some(rate) = close.measured_decode_tps {
+                        done.measured_decode_tps = Some(rate);
+                    }
+                    // TTFT / ITL: the in-loop exact-pair stamps already
+                    // gave the finishing record the engine's histogram
+                    // readings on the completion scrape (`ttft_secs` is
+                    // that histogram's mean, not a per-request span; the
+                    // idle scrape's close carries it exact for engines
+                    // that move their ledgers when the phase goes dark).
+                    // The rescue must not re-stamp a busy scrape's mean
+                    // over the honest span the record already holds.
+                    if close.ttft_secs > 0.0
+                        && (close.id_task == done.id_task
+                            || (done.ttft.is_none() && done.prefill_tokens <= 1))
+                        && (done.ttft.is_none()
+                            || done
+                                .ttft
+                                .is_some_and(|t| (t as f64) < close.ttft_secs * 0.5))
+                    {
+                        done.ttft = Some(close.ttft_secs as f32);
+                    }
+                    if close.itl_sum > 0.0 {
+                        done.itl_sum = Some(close.itl_sum as f32);
+                    }
+                    // Physical ceiling: P prompt tokens in T seconds of
+                    // measured TTFT cannot beat P/T — the row's printed
+                    // rate reads back through the span it finally took.
+                    if let (Some(ttft), true) = (done.ttft, done.prompt_tokens > 1) {
+                        if ttft > 0.0 {
+                            let ceiling = done.prompt_tokens as f32 / ttft;
+                            if let Some(rate) = done.measured_prefill_tps {
+                                if rate > ceiling {
+                                    // An engine-measured rate is not a
+                                    // fabrication: a span estimate that
+                                    // outruns it divided a window the
+                                    // engine never published. Keep the
+                                    // engine's own mean.
+                                    if done.prefill_secs == 0.0 {
+                                        done.measured_prefill_tps = Some(ceiling);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-                // Unconditional: only the backdate is gated on a usable
-                // TTFT — a record without one must still stop being
-                // "live" or its row pulses with a growing duration
+                // Unconditional: only the corrections above are gated on
+                // a closing view — a record without one must still stop
+                // being "live" or its row pulses with a growing duration
                 // forever.
                 done.ended = Some(now);
+                // Same backdate the closing view's shape gets: the
+                // engine's TTFT + total inter-token time is the request's
+                // true wall span (admission -> last token); llama.cpp rows
+                // have no histograms and keep the detection-based span.
+                if done.ttft.is_some_and(|t| t > 0.0) {
+                    let e2e = done.ttft.unwrap() as f64 + done.itl_sum.unwrap_or(0.0) as f64;
+                    if let Some(st) = now.checked_sub(Duration::from_secs_f64(e2e)) {
+                        done.started = st;
+                    }
+                }
                 self.finish(done);
             }
             self.current = Some(RequestRecord::new(s.id_task, now, s));
@@ -738,10 +932,37 @@ impl PerfTracker {
         } else {
             s.prompt_processed
         };
+        // Mlx credits a request's whole token span at its *completion*,
+        // while the whole-counter window can move while the *successor* is
+        // already lit. The vllm-shaped completion edge is the adapter's
+        // own: it names the finished request through the per-request
+        // histograms (`exact_prompt`) while `closing` rides the same
+        // scrape. On that scrape the session tallies' deltas below belong
+        // to the finished request — the closing rescue bills them, so
+        // counting them here too would double-bill. (Strata publishes
+        // neither field on its live scrapes, and strata's own completion
+        // rides an idle scrape where this never fires.)
+        let completion_edge = s.exact_prompt > 0 && s.closing.is_some();
+        // Continuous batching: the adapter's whole-counter window can move
+        // while a *different* request is in flight — mlx credits the
+        // finished request's whole sizes as a successor keeps `running`
+        // lit, and the in-flight record sees the movement it did not earn
+        // (the flood's 11,220-token row). The adapter's own attribution is
+        // the honest ledger: a lit scrape's whole-counter movement names a
+        // completed request (`published_prompt > 0`), so the record-level
+        // spans and poll-window rates read blank there; the published pair
+        // and the closing rescue own those tokens instead.
+        let foreign_move = s.published_prompt > 0 && s.processing;
+        let (d_pre_rec, d_dec_rec) = if foreign_move { (0, 0) } else { (d_pre, d_dec) };
+        let (d_pre_bill, d_dec_bill) = if completion_edge {
+            (0, 0)
+        } else {
+            (d_pre, d_dec)
+        };
 
         self.phase = if !s.processing {
             Phase::Idle
-        } else if d_dec > 0 || (s.decoded > 0 && d_pre == 0) {
+        } else if d_dec_rec > 0 || (s.decoded > 0 && d_pre_rec == 0) {
             Phase::Decode
         } else {
             Phase::Prefill
@@ -749,8 +970,8 @@ impl PerfTracker {
 
         // Windowed rates: steady under bursty speculative decoding, and they
         // fall to zero within a second of the counter stopping.
-        self.decode_win.push(t0, now, d_dec);
-        self.prefill_win.push(t0, now, d_pre);
+        self.decode_win.push(t0, now, d_dec_rec);
+        self.prefill_win.push(t0, now, d_pre_rec);
         if !s.processing {
             self.decode_win.clear();
             self.prefill_win.clear();
@@ -761,8 +982,8 @@ impl PerfTracker {
         // prefill rate would divide the whole prompt by one poll
         // interval. When a request closes in this window, use its
         // measured TTFT as the denominator instead (tokens / TTFT).
-        if !s.processing && s.ttft_secs > 0.0 && d_pre > 0 {
-            self.prefill_tps = self.prefill_tps.max(d_pre as f32 / s.ttft_secs as f32);
+        if !s.processing && s.ttft_secs > 0.0 && d_pre_rec > 0 {
+            self.prefill_tps = self.prefill_tps.max(d_pre_rec as f32 / s.ttft_secs as f32);
         }
         if let Some(rate) = s.prefill_tps {
             self.prefill_tps = rate;
@@ -771,8 +992,10 @@ impl PerfTracker {
         // completion poll — which is exactly when the window above was
         // cleared — so use the measured ITL sum (one sample per decode
         // step, i.e. decoded - 1 of them).
-        if !s.processing && s.itl_sum > 0.0 && d_dec > 1 {
-            self.decode_tps = self.decode_tps.max((d_dec - 1) as f32 / s.itl_sum as f32);
+        if !s.processing && s.itl_sum > 0.0 && d_dec_rec > 1 {
+            self.decode_tps = self
+                .decode_tps
+                .max((d_dec_rec - 1) as f32 / s.itl_sum as f32);
         }
         let ema = |prev: f32, x: f32, up: f32, down: f32| -> f32 {
             let a = if x > prev { up } else { down };
@@ -793,18 +1016,70 @@ impl PerfTracker {
         self.bw.prefill.update(self.prefill_tps, now, dt);
         push(&mut self.decode_hist, self.decode_tps);
         push(&mut self.prefill_hist, self.prefill_tps);
-        self.session_decoded += d_dec as u64;
-        self.session_prefilled += d_pre as u64;
+        self.session_decoded += d_dec_bill as u64;
+        self.session_prefilled += d_pre_bill as u64;
 
+        // Two exact ledgers on every vllm-shaped scrape: the per-request
+        // histograms (`exact_prompt`, shared — foreign completions move them
+        // and the adapter refuses the pair when a window was dishonest) and
+        // the whole-token counters' one-scrape delta (`published_prompt`,
+        // mlx's own ledger: a request's whole span lands there in a block
+        // at its completion, prefix-cache restores included, nothing
+        // foreign). Whichever names the finished request sets the spans.
+        let exact_prompt = if s.exact_prompt > 0 {
+            s.exact_prompt
+        } else {
+            s.published_prompt
+        };
+        let exact_gen = if s.exact_gen > 0 {
+            s.exact_gen
+        } else {
+            s.published_gen
+        };
         if let Some(cur) = self.current.as_mut() {
             // The slot can still carry the previous request's prompt size on
             // the first sample, so always take the latest value.
             cur.prompt_tokens = s.prompt_tokens;
             cur.cached_tokens = s.cache_tokens;
             cur.decoded = cur.decoded.max(s.decoded);
-            if d_pre > 0 {
-                cur.prefill_tokens += d_pre;
+            if let Some(close) = s.closing.as_ref() {
+                // The completion scrape re-anchored the adapter's baselines,
+                // so the record's own prompt/cached reads came back blank;
+                // the closing view still names them. Take them once — the
+                // rescue re-reads the same closing view on the next scrape
+                // and must not re-bill the spans it already applied.
+                if cur.prompt_tokens == 0 && close.prompt > 0 {
+                    cur.prompt_tokens = close.prompt;
+                    cur.cached_tokens = close.cached;
+                }
+            }
+            // A lit scrape that moved the whole-token counters completed
+            // someone's request — under continuous batching the successor's
+            // record watches that happen and must not bill the movement to
+            // its own prefill. (The close's rescue reads the same pair and
+            // gives it to the finished row; mlx's in-flight request moves
+            // `prompt_processed` through its own live span, which is not
+            // this ledger.) Strata and llama publish no pair at all.
+            if d_pre_rec > 0 {
+                cur.prefill_tokens += d_pre_rec;
                 cur.prefill_secs += dt;
+                // The published-span ceiling, applied after the
+                // accumulation and only where the close names *this*
+                // record: a completion publishes someone's whole span
+                // between two adapter scrapes while a successor is lit,
+                // and the closing rescue gives those tokens to the finished
+                // row. Where the close does name this record, its prompt
+                // clamps to the span the engine published (0 = none).
+                let named_here = s
+                    .closing
+                    .as_ref()
+                    .filter(|c| c.id_task == cur.id_task)
+                    .map_or(0, |c| c.span_known);
+                if named_here > 0 && cur.prompt_tokens > named_here as usize {
+                    cur.prompt_tokens = named_here as usize;
+                    cur.cached_tokens = cur.cached_tokens.min(cur.prompt_tokens);
+                    cur.prefill_tokens = cur.prompt_tokens - cur.cached_tokens;
+                }
             }
             if self.phase == Phase::Prefill {
                 if let Some(rate) = s.prefill_tps {
@@ -812,13 +1087,23 @@ impl PerfTracker {
                 }
             }
             if let Some(secs) = s.prefill_secs {
-                self.session_prefilled = self
-                    .session_prefilled
-                    .saturating_sub(cur.prefill_tokens as u64)
-                    .saturating_add(s.prompt_processed as u64);
-                cur.set_prefill_timing(s.prompt_processed, secs);
+                // Strata's completion carries the request's exact prompt
+                // size and span: replace the record's live estimates with
+                // the engine's final counts. Mlx stamps *its* engine span
+                // on the scrape that moves the counters, which under busy
+                // batching still shows a successor in flight — that span
+                // belongs to the finished request alone, and the adapter
+                // has already staged it into the closing view. Claim it
+                // only once this record's own request is over.
+                if !s.processing {
+                    self.session_prefilled = self
+                        .session_prefilled
+                        .saturating_sub(cur.prefill_tokens as u64)
+                        .saturating_add(s.prompt_processed as u64);
+                    cur.set_prefill_timing(s.prompt_processed, secs);
+                }
             }
-            if d_dec > 0 {
+            if d_dec_rec > 0 {
                 cur.decode_secs += dt;
                 cur.peak_decode_tps = cur.peak_decode_tps.max(self.decode_tps);
                 if cur.first_token.is_none() {
@@ -829,10 +1114,149 @@ impl PerfTracker {
             // request carries its whole TTFT / ITL lifetime in one
             // delta; stamp it onto the record.
             if s.ttft_secs > 0.0 {
-                cur.ttft = Some(s.ttft_secs as f32);
+                // vLLM's measured TTFT arrives whole on the *completion*
+                // scrape — and under continuous batching the completion
+                // and a successor's admission share one scrape, so this
+                // stats carries the finished request's TTFT while `cur`
+                // is already the successor's record. Stamp it only on the
+                // record it was measured for; the closing rescue gives it
+                // to the finished row, and the successor's own record gets
+                // its TTFT on *its* completion scrape.
+                if !s.processing {
+                    // Only an idle scrape's TTFT can name *this* record's
+                    // request: mlx credits the TTFT sums at completion, and
+                    // under continuous batching the completion scrape is
+                    // already the successor's first sample. vLLM's honest
+                    // shape closes on the same scrape the TTFT arrives and
+                    // reads this way too (the rescue owns the finished row).
+                    cur.ttft = Some(s.ttft_secs as f32);
+                } else if s.id_task == cur.id_task {
+                    cur.ttft = Some(s.ttft_secs as f32);
+                }
             }
             if s.itl_sum > 0.0 {
                 cur.itl_sum = Some(s.itl_sum as f32);
+            }
+            // Precision correction: a record may carry a TTFT stamped from
+            // the poll cadence (the window's mean over a scrape that could
+            // not see the true span — 0.10s against a real 6.8s). Once this
+            // record's own request completes and the engine's TTFT
+            // histogram moves by exactly one count, that mean is the
+            // request's exact span; read the row back through it. (Only
+            // for records that had no honest span: vLLM's completion-edge
+            // TTFT arrives exact and never needs correcting.)
+            if exact_prompt > 0
+                && exact_gen > 0
+                && s.ttft_secs > 0.0
+                && !s.processing
+                && cur.ttft.is_some_and(|t| (t as f64) < s.ttft_secs * 0.5)
+            {
+                cur.ttft = Some(s.ttft_secs as f32);
+            }
+            if s.id_task == cur.id_task || !s.processing {
+                // Mlx's engine-published mean: exact numerator (the step
+                // counter's whole-window movement) and denominator (the
+                // window's span), so it wins over prompt-delta / TTFT —
+                // mlx's prompt counter credits this request with every
+                // request's prefix-cache restores. Attribution: a *lit*
+                // scrape's pair describes the request its window says
+                // completed — on a busy server that is whoever finished,
+                // not whoever the panels opened a row for. Mlx's live meter
+                // republishes the in-flight request's rate every scrape,
+                // so refusing a foreign pair loses nothing.
+                if let Some(rate) = s.measured_prefill_tps {
+                    cur.measured_prefill_tps = Some(rate);
+                }
+                if let Some(rate) = s.measured_decode_tps {
+                    // The engine-derived decode mean (TTFT minus the measured
+                    // prefill span): mlx's counters freeze until completion,
+                    // so the poll-sum rate below reads the whole request over
+                    // one poll interval.
+                    cur.measured_decode_tps = Some(rate);
+                }
+            }
+            if let Some(secs) = s.prefill_secs {
+                // The engine's measured prefill span, stamped when the
+                // record has no span of its own (mlx's counters move once,
+                // at completion, and the completion scrape can be the
+                // first one to carry them). `set_prefill_timing` recomputes
+                // the exact rate from the record's own token count.
+                if cur.prefill_secs == 0.0 && s.id_task == cur.id_task {
+                    // Task identity: a span riding a completion scrape was
+                    // measured for the request that *finished*; a
+                    // successor's record must not time its own prefill at
+                    // the previous request's span. (Mlx's live gauge can
+                    // publish a finishing request's `prefill_secs` while
+                    // the successor is already lit — the same straddle the
+                    // exact pair and TTFT stamps guard.)
+                    cur.set_prefill_timing(cur.prefill_tokens, secs);
+                }
+                // A record whose TTFT the completion counters never
+                // named (the completion's scrape carried no TTFT delta:
+                // mlx moves its sums while `running` stays lit and the
+                // adapter's window can miss them) still knows its prefill
+                // span. The engine measured it for this request: it is the
+                // one span the flood cannot reach, and it beats printing
+                // `0.00s` for a request that clearly ran.
+                if cur.ttft.is_none()
+                    && secs > 0.0
+                    && s.id_task == cur.id_task
+                    && (cur.measured_prefill_tps.is_some() || s.exact_prompt > 0)
+                {
+                    // The span is this record's own (the engine measured a
+                    // rate for it, or its exact prompt is known): a request
+                    // that clearly ran cannot print `0.00s`. A bare staged
+                    // span with no rate and no exact pair is somebody
+                    // else's residual note.
+                    cur.ttft = Some(secs as f32);
+                }
+            }
+            if exact_prompt > 0 && s.itl_sum > 0.0 {
+                // The engine's per-request histogram names the in-flight
+                // request's exact prompt size, and it moves exactly once
+                // the request completes. A record carrying a bigger span
+                // is reading a window that straddled a busy scrape — the
+                // same correction the closing rescue makes, applied while
+                // the record is still live so a completion that never
+                // forms a closing view (the phase-dark scrape's own stats
+                // finishing the record) still reads through the exact
+                // counts. (Mlx's shape: its ITL histogram exists but moves
+                // with completions, and strata publishes no such pair at
+                // all — a scrape carrying neither keeps its own exact
+                // counters.)
+                if cur.prompt_tokens != exact_prompt as usize {
+                    let pre = exact_prompt.saturating_sub(cur.cached_tokens as u64);
+                    self.session_prefilled = self
+                        .session_prefilled
+                        .saturating_sub(cur.prefill_tokens as u64)
+                        .saturating_add(pre);
+                    cur.prompt_tokens = exact_prompt as usize;
+                    cur.prefill_tokens = pre as usize;
+                }
+                if exact_gen > 0 && cur.decoded != exact_gen as usize {
+                    self.session_decoded = self
+                        .session_decoded
+                        .saturating_sub(cur.decoded as u64)
+                        .saturating_add(exact_gen);
+                    cur.decoded = exact_gen as usize;
+                }
+            }
+            // Physical ceiling on whatever rate the record carries: P
+            // prompt tokens in T seconds of measured TTFT cannot beat
+            // P/T. Applies on every scrape — the completion's stamped
+            // stats go stale under continuous batching (the next poll
+            // already belongs to the successor), and a row that printed
+            // the flood's rate before its close must read back through
+            // the exact counts the moment they land.
+            if let (Some(ttft), true) = (cur.ttft, exact_prompt > 0) {
+                if ttft > 0.0 {
+                    let ceiling = exact_prompt as f32 / ttft;
+                    if let Some(rate) = cur.measured_prefill_tps {
+                        if rate > ceiling {
+                            cur.measured_prefill_tps = Some(ceiling);
+                        }
+                    }
+                }
             }
             if !s.processing {
                 let mut done = self.current.take().unwrap();
@@ -841,7 +1265,7 @@ impl PerfTracker {
                 // total inter-token time is the request's true wall
                 // span (admission -> last token). llama.cpp rows have
                 // no histograms and keep the detection-based span.
-                if done.ttft.map_or(false, |t| t > 0.0) {
+                if done.ttft.is_some_and(|t| t > 0.0) {
                     let e2e = done.ttft.unwrap() as f64 + done.itl_sum.unwrap_or(0.0) as f64;
                     if let Some(st) = now.checked_sub(Duration::from_secs_f64(e2e)) {
                         done.started = st;
@@ -854,7 +1278,25 @@ impl PerfTracker {
         self.last_sample = Some((now, s.clone()));
     }
 
-    fn finish(&mut self, r: RequestRecord) {
+    fn finish(&mut self, mut r: RequestRecord) {
+        // The engine's spans beat detection timing when the request's own
+        // counters moved between two scrapes (mlx's completion): the
+        // in-loop rates divided a whole span by the one interval the poll
+        // happened to observe. Decode: TTFT minus the engine's measured
+        // prefill span is the request's whole decode lifetime — the same
+        // split the closing rescue makes, applied to records that did see
+        // their own prefill stream. vLLM's rows keep their ITL histogram.
+        if r.measured_decode_tps.is_none()
+            && r.itl_sum.is_none()
+            && r.prefill_secs > 0.0
+            && r.decoded > 1
+        {
+            let ttft = r.ttft.map_or(0.0, |t| t as f64);
+            let decode_secs = ttft - r.prefill_secs as f64;
+            if decode_secs > 0.05 {
+                r.measured_decode_tps = Some(((r.decoded - 1) as f64 / decode_secs) as f32);
+            }
+        }
         if r.decoded == 0 && r.prefill_tokens == 0 {
             return;
         }
@@ -1084,12 +1526,21 @@ mod tests {
                 0.0,
                 0.0,
                 Some(crate::observe::ClosingRequest {
+                    id_task: 5,
                     prompt: 1000,
                     cached: 100,
                     gen: 40,
                     prefill_secs: None,
+                    measured_prefill_tps: Some(450.0),
+                    measured_decode_tps: None,
                     ttft_secs: 2.0,
                     itl_sum: 0.05,
+                    published_prompt: 0,
+                    published_gen: 0,
+                    published_completions: 1,
+                    span_known: 0,
+                    exact_prompt: 0,
+                    exact_gen: 0,
                 }),
             ),
             t0 + step + Duration::from_secs(17),
@@ -1148,12 +1599,25 @@ mod tests {
                 0.0,
                 0.0,
                 Some(crate::observe::ClosingRequest {
+                    // The close names the *finished* request — task 5 — even
+                    // though a successor (task 6) lit the same scrape. The
+                    // row it rescues must still close (no TTFT: a row with
+                    // no usable span must not stay "live" forever).
+                    id_task: 5,
                     prompt: 100,
                     cached: 0,
                     gen: 10,
                     prefill_secs: None,
+                    measured_prefill_tps: None,
+                    measured_decode_tps: None,
                     ttft_secs: 0.0,
                     itl_sum: 0.0,
+                    published_prompt: 0,
+                    published_gen: 0,
+                    published_completions: 1,
+                    span_known: 0,
+                    exact_prompt: 0,
+                    exact_gen: 0,
                 }),
             ),
             t0 + step * 2,

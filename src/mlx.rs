@@ -217,6 +217,40 @@ pub struct LiveRates {
     /// (0.0 = no window). Edge quantization is one poll, ~100 ms.
     prefill_total_base: f64,
     prefill_total_lit: f64,
+    /// The open request's generation size as it decodes: the live step
+    /// gauge's running total while the request is lit, so a completion
+    /// scrape that reads blank of its own still names how many tokens the
+    /// request produced. Reset with the request.
+    gen_total_lit: f64,
+    /// The in-flight request's whole prompt as the engine's live gauges
+    /// published it (`prefill_expected`, seen whole at admission), 0 while
+    /// the request decoded its response. Perf's record of THIS request
+    /// reads its span back through it whenever a completion-driven view
+    /// tries to inflate it (the flood's 12,070 where 9,698 belonged).
+    span_known: usize,
+    /// `prompt_total` at the scrape *before* the in-flight request's
+    /// expectation first lit: the span ledger opens one scrape early so a
+    /// foreign publication that crossed the admission scrape itself (the
+    /// flood shape) stays outside the span.
+    span_pre_open: f64,
+    /// The engine read fully dark on the previous scrape (no prefill lit,
+    /// nothing processing): the next window opens blank — a whole-counter
+    /// publication that crossed the dark stretch credits no tracked row.
+    engine_was_dark: bool,
+    /// The in-flight request's whole prompt (fresh expectation + prefix-
+    /// cache restores seen while prefilling). Held across the decode —
+    /// the gauges fall blank at the prefill's end — and stamped on the
+    /// close the adapter builds for this request. New expectation, new
+    /// window; engine dark, cleared.
+    whole_span: u64,
+    /// The whole-token counters' positions at the previous scrape. Mlx
+    /// moves `prompt_tokens_total` and `generation_tokens_total` once per
+    /// completion, crediting the finished request's whole sizes (prefix-
+    /// cache restores ride `cached_tokens_total`, a different ledger), so
+    /// the delta over these anchors — attributed by the completion count
+    /// moving too — names exactly one request's sizes.
+    prev_pre_total: f64,
+    prev_gen_total: f64,
     prefill_expected: f64,
     prefill_total_secs: f32,
     /// The rate's base: `prefill_tokens_total` as of the scrape the last
@@ -240,6 +274,29 @@ pub struct LiveRates {
     /// `prefill_tokens_live` as of the previous scrape (the engine's block
     /// publication; nothing divides by it, it exists to open windows).
     prefill_live_base: f64,
+    /// The engine's TTFT histogram sums as of the previous scrape: the
+    /// completion scrape's delta is the finished request's exact TTFT (the
+    /// prefill span is measured while the engine runs one request), and
+    /// what the TTFT leaves after the prefill is its decode span.
+    ttft_sum_base: f64,
+    ttft_count_base: f64,
+    /// `succeeded` as of the previous scrape: its movement is the engine's
+    /// completion, which the adapter's phase may lag by one poll.
+    succeeded_base: f64,
+    span_ttft_sum: f64,
+    span_pre_total: f64,
+    /// The request's exact means, computed on the scrape its vllm-named
+    /// counters moved (the engine's completion, which the adapter's `run-
+    /// ning` may still read lit for one more poll): both the panel's
+    /// in-flight line and the adapter's closing view carry them until the
+    /// request retires, so perf.rs sees the pair on whichever edge order
+    /// the completion falls into.
+    staged_prefill: Option<f32>,
+    /// The exact span `staged_prefill` divided by — the window's measured
+    /// prefill seconds. Travels as `LiveStats.prefill_secs` so perf.rs's
+    /// engine-published rate and any reconstruction share one denominator.
+    staged_prefill_secs: Option<f64>,
+    staged_decode: Option<f32>,
     /// Detection's answer from the engine's `/v1/models`: the model carries
     /// MTP layers and the engine says they are available. mlx-serve pub-
     /// lishes no speculative counters, so the shared adapter's identity
@@ -255,6 +312,13 @@ impl Default for LiveRates {
             gen_base: 0.0,
             prefill_total_base: 0.0,
             prefill_total_lit: 0.0,
+            gen_total_lit: 0.0,
+            span_known: 0,
+            whole_span: 0,
+            span_pre_open: 0.0,
+            engine_was_dark: true,
+            prev_pre_total: 0.0,
+            prev_gen_total: 0.0,
             prefill_expected: 0.0,
             prefill_total_secs: 0.0,
             rate_base: 0.0,
@@ -263,6 +327,14 @@ impl Default for LiveRates {
             last_prompt: 0,
             last_cached: 0,
             prefill_live_base: 0.0,
+            ttft_sum_base: 0.0,
+            ttft_count_base: 0.0,
+            succeeded_base: 0.0,
+            span_ttft_sum: 0.0,
+            span_pre_total: 0.0,
+            staged_prefill: None,
+            staged_prefill_secs: None,
+            staged_decode: None,
             mtp: false,
         }
     }
@@ -281,7 +353,13 @@ impl LiveRates {
     /// Fold one scrape into the slot, enriching the shared adapter's view
     /// with the live token counts and in-flight prefill rate. The closing
     /// sample passes through untouched: the completion counters are exact.
-    pub fn observe(&mut self, c: &VllmCounters, g: &LiveGauges, stats: &mut LiveStats) {
+    pub fn observe(
+        &mut self,
+        c: &VllmCounters,
+        g: &LiveGauges,
+        stats: &mut LiveStats,
+        adapter: &mut crate::vllm::VllmAdapter,
+    ) {
         if g.generation_live < self.gen_base - 0.5
             || g.prefill_total < self.prefill_total_base - 0.5
         {
@@ -300,6 +378,9 @@ impl LiveRates {
 
         let lit = g.prefill_expected > 0.0 || g.prefill_live > 0.0;
         let completed = stats.processing && !self.running;
+        // mlx reveals completion via its vllm-named counters moving while
+        // the adapter's `running` may stay lit one more poll.
+        let counters_moved = c.succeeded > self.succeeded_base + 0.5;
 
         // mlx-serve says `mtp_loaded` on /v1/models but publishes no specu-
         // lative counters at all, so the shared adapter answers every scrape
@@ -316,6 +397,7 @@ impl LiveRates {
         if stats.processing {
             let live_decoded = (g.generation_live - self.gen_base).max(0.0) as usize;
             stats.decoded = stats.decoded.max(live_decoded);
+            self.gen_total_lit = self.gen_total_lit.max(g.generation_live - self.gen_base);
 
             // The window model, as the live server publishes it (traced on
             // the M5 Max engine through its whole lifecycle). `requests_
@@ -349,13 +431,37 @@ impl LiveRates {
             // and runs to the request's completion scrape.
             let new_request =
                 g.prefill_expected > 0.0 && g.prefill_expected != self.prefill_expected;
-            // "Freshly admitted" is the adapter's answer — processing this
-            // scrape, not last — since a live server has been processing
-            // long before this request's expectation ever lands.
+            // A new expectation is a new request: the window opens on it
+            // whether the slot was idle (fresh admission) or the previous
+            // request's completion counters land on the same scrape
+            // (continuous batching). The finishing request's exact means
+            // are safe from the reset because the completion pair is com-
+            // puted from the window's *snapshot* positions, taken when the
+            // previous request's window opened — see the pair's block.
             if new_request {
                 self.prefill_total_lit = 0.0;
+                self.gen_total_lit = 0.0;
                 self.prefill_live_base = g.prefill_live;
                 self.prefill_total_secs = 0.1;
+                // The request's positions at the window's opening: the
+                // server's TTFT sums cannot move before its completion, so
+                // their delta across the request is its exact lifetime; the
+                // step counter's delta across the same span is its exact
+                // prefill work. Carried through decode and the completion
+                // scrape: the expectation's replacement names the previous
+                // request's end.
+                self.span_ttft_sum = c.ttft_sum;
+                self.span_pre_total = g.prefill_total;
+                self.staged_prefill = None;
+                self.staged_prefill_secs = None;
+                self.staged_decode = None;
+                self.prefill_rate = 0.0;
+                // A fresh request's prompt memory starts fresh: the pre-
+                // vious request's lit peak must never masquerade as this
+                // one's publication (the window's lit peak is the *finishing*
+                // request's exact prompt at completion).
+                self.prefill_total_lit = 0.0;
+                self.gen_total_lit = 0.0;
                 // The expectation's whole-size landing is never a division
                 // input: the base starts at the landing scrape's value, so
                 // the first reading measures the engine's own steps from the
@@ -369,8 +475,15 @@ impl LiveRates {
                 // yet: open the window early so the prefill's first steps
                 // are measuring from its first scrape.
                 self.prefill_total_lit = 0.0;
+                self.gen_total_lit = 0.0;
                 self.prefill_live_base = g.prefill_live;
                 self.prefill_total_secs = 0.1;
+                self.span_ttft_sum = c.ttft_sum;
+                self.span_pre_total = g.prefill_total;
+                self.staged_prefill = None;
+                self.staged_prefill_secs = None;
+                self.staged_decode = None;
+                self.prefill_rate = 0.0;
                 // Same half-beat rule as the expectation's landing: the
                 // phase bit flips between polls, so the opening scrape
                 // charges no span and its own step is a value, never a
@@ -484,19 +597,314 @@ impl LiveRates {
         }
 
         // The request is over: its window (and the published progress line
-        // it carried) ends with it. The completion scrape still charges
-        // the span once more (the engine's movement on this very scrape,
-        // clamped to the request's own span delta, over the span including
-        // this beat), so the last in-flight reading is honest even when
-        // the publish cadence went dark for the prefill's tail. From the
-        // completion on, perf.rs's measured-TTFT path carries the
-        // request's exact prefill mean.
-        if completed || !stats.processing {
+        // it carried) ends with it. From the completion on, the request's
+        // exact means are the engine's own numerators and denominators.
+        // Prefill side: mlx's `prompt_tokens_total` counts every request's
+        // prefix-cache restores (~211M of 216M tokens on a cache-heavy
+        // server) and moves them on the completion scrape, so the adapter's
+        // whole-span prompt delta attributes other requests' cache traffic
+        // to this request and perf's `prompt / TTFT` reads tens of
+        // thousands tok/s. Decode side: mlx publishes no ITL histogram at
+        // all while its token counters freeze until completion, so perf's
+        // poll-window decode rate divides the whole request by one poll
+        // interval. The engine's two spans answer both: the prefill is the
+        // step counter's movement across the window that stayed lit, the
+        // decode the TTFT (the histogram's sums move once per completion,
+        // so their delta across the window is this request's exact
+        // lifetime) minus that span. Both travel to perf.rs on this
+        // scrape's `LiveStats` AND through the adapter's closing view
+        // (`note_measured_rates`): the engine's counters move while the
+        // adapter's `running` is still lit, and the adapter's own success
+        // edge — the scrape perf.rs actually builds the record's completion
+        // view from — can fall one poll later. Whichever edge ordering the
+        // completion lands on, the record gets the pair.
+
+        let finished = self.running && !stats.processing;
+        let d_count = (c.succeeded - self.succeeded_base).max(0.0);
+        // Track the in-flight request's published span: the expectation
+        // arrives whole when a request is admitted. The gauges *hold* the
+        // finished request's value while the engine stays lit, so a new
+        // window opens only when a *different* expectation lands — that
+        // one names the successor the panels will open a row for.
+        if g.prefill_expected > 0.0 && (g.prefill_expected as usize) != self.span_known {
+            // gauges hold the finished request's expectation while the
+            // engine stays lit; a different value is a new admission and
+            // opens a fresh window.
+            self.span_known = g.prefill_expected as usize;
+            self.whole_span = 0;
+        } else if g.prefill_expected > 0.0 {
+            self.span_known = g.prefill_expected as usize;
+        }
+        if self.engine_was_dark && g.requests_prefilling {
+            // the engine lit since the previous scrape: whatever the whole
+            // ledger moved across that dark stretch belongs to no row the
+            // panels can name, and the window starts blank at this scrape.
+            self.whole_span = 0;
+        }
+        self.engine_was_dark = !g.requests_prefilling && !stats.processing;
+        // The in-flight request's span ledger: `prompt_total` stands still
+        // while a request runs (mlx credits the finished request's whole
+        // prompt at its completion), so the movement across the span from
+        // the scrape *before* its expectation first lit through the
+        // scrape the completion lands on is the request's whole prompt —
+        // fresh portion plus its prefix-cache restores. Anomaly: the
+        // probe's quiet row printed 12,069 against a published 10,868
+        // because the churner's publication crossed the window's opening
+        // scrape; anchoring one scrape earlier (the same rule the
+        // adapter's straddle branch uses for its close) puts the foreign
+        // movement outside the span.
+        if !stats.processing && !g.requests_prefilling && g.prefill_expected == 0.0 {
+            self.span_known = 0;
+            self.whole_span = 0;
+        }
+        if counters_moved {
+            // the window's request completed: its held live sum belongs to
+            // a closed request; the successor's expectation opens a fresh
+            // window (and a fresh ledger span) on its own scrape.
+            self.whole_span = 0;
+        }
+        // The pair's engine edge is `counters_moved`: mlx moves its vllm-
+        // named counters while `running` stays lit, so the adapter's own
+        // success edge (`completed`, or the phase going dark under it)
+        // fires one scrape *later* — by then the baselines it captures the
+        // finished request against have moved on. The adapter's close is
+        // staged from counters that still bracket the request exactly.
+        if (completed || counters_moved && stats.processing)
+            && (self.prefill_expected > 0.0
+                || g.prefill_expected > 0.0
+                || self.prefill_total_secs > 0.0)
+        {
+            // The window's span as the rate model charged it: the window
+            // charges on every scrape through the request's decode (the
+            // model freezes at completion, not at the prefill's close) and
+            // the pair is computed after this scrape's charge. No span
+            // means a request the window never saw (a completion across a
+            // server restart).
+            let span = if self.prefill_total_secs > 0.0 {
+                // The window's charge on *this* scrape already happened
+                // (the span charges on every scrape of the open window
+                // before the pair is computed): the completion scrape adds
+                // no extra interval. A window that retired between scrapes
+                // (a restart mid-request) keeps its last-charged span.
+                self.prefill_total_secs as f64
+            } else {
+                0.0
+            };
+            // The engine's whole-request prefill: the step counter's
+            // movement since the window opened (its idle-snapshot base:
+            // the request's own work is exactly what moved after the
+            // engine went quiet), over the window's span.
+            // `(tokens, rate)`: the engine's whole-request prefill.
+            let prefill_pair = if span > 0.0 {
+                let moved = (g.prefill_total - self.span_pre_total).max(0.0);
+                // The finishing request's published prompt size: the
+                // window's lit peak, or the engine's own movement. The
+                // gauges' expectation on *this* scrape belongs to whoever
+                // the engine is publishing right now — a completion scrape
+                // can already carry the successor's request — so the
+                // window's own memory of the request's size is the only
+                // safe source.
+                let tokens = self.prefill_total_lit.max(moved);
+                if tokens > 0.0 {
+                    Some((tokens, tokens / span))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            // The request's exact TTFT from the histogram's sums: the
+            // count delta names the completions that landed (exactly this
+            // request's — the window measured a single-request engine), so
+            // the sums' delta divided by it is the exact lifetime. 0.0
+            // when the server publishes no histogram (vLLM's unit-test
+            // shape), which leaves the decode rate unpublished rather
+            // than guessed.
+            let count_delta = (c.ttft_count - self.ttft_count_base).max(0.0);
+            let ttft = if count_delta > 0.5 {
+                (c.ttft_sum - self.ttft_sum_base).max(0.0) / count_delta
+            } else if c.ttft_sum > self.span_ttft_sum + 1e-9 {
+                // the sums moved on the scrape before either edge (the
+                // engine's completion poll preceded the adapter's): the
+                // delta against the window's base is still this request's
+                (c.ttft_sum - self.span_ttft_sum).max(0.0)
+            } else {
+                0.0
+            };
+            let decode_rate = match (prefill_pair, ttft) {
+                (Some((tokens, pre_rate)), ttft) if tokens > 1.0 => {
+                    // The prefill span the engine measured: its published
+                    // prompt over the published rate.
+                    let pre_secs = tokens / pre_rate;
+                    let decode_secs = ttft - pre_secs;
+                    if decode_secs > 0.05 && stats.decoded > 1 {
+                        Some(((stats.decoded - 1) as f64 / decode_secs) as f32)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            self.staged_prefill = prefill_pair.map(|(_tokens, rate)| rate as f32);
+            self.staged_prefill_secs = prefill_pair.map(|(tokens, rate)| tokens / rate);
+            self.staged_decode = decode_rate;
+        }
+        // The whole-token counters' pair (`published_prompt`/`published_
+        // gen`): the adapter computes the deltas over its own two scrapes
+        // and hands them to the close and the in-loop record. LiveRates
+        // verifies the shape here — mlx moves `prompt_tokens_total` in one
+        // block per completion, so the pair names the request whose
+        // completion this scrape carried, never an in-flight one — and
+        // publishes nothing when the ledgers moved without the completion
+        // count moving (a publication the adapter's scrapes straddled:
+        // whose sizes no close may claim).
+        // Attribute the whole-token counters' delta: mlx moves that ledger
+        // one completion's sizes at a time, so only a scrape that moves the
+        // completion count too names a request — and only a count delta of
+        // exactly one names a *single* request the panels can point at.
+        // Anything else (the counters moved with no completion seen, the
+        // adapter missed the publication scrape; a batch of completions
+        // landed at once) belongs to no row the panels printed, and a span
+        // on a lit scrape is a successor watching someone else's request
+        // close. LiveRates scrapes at the panels' cadence with the same
+        // adapter, so its two-scrape bracket cannot move unseen — unlike
+        // the vllm adapter's request-window baselines, which straddle the
+        // churn. (This is what kept the probe's quiet row printing 12,100
+        // instead of 9,698: the churner's publication landed between two
+        // adapter scrapes, and the request-window delta absorbed it.)
+
+        // The engine's exact publication for the request that completed
+        // since the previous scrape: the whole-token ledger's delta, valid
+        // only when the completion count moved by exactly one (a batch
+        // credits no tracked row alone). The adapter's close may name this
+        // request's span no bigger than the engine published it — a bigger
+        // span absorbed a foreign publication (the flood's 12,100 where
+        // 9,698 belonged). LiveRates reads the same counters as the
+        // adapter, one scrape behind its edge at most.
+        // A completion count of more than one since the previous scrape:
+        // several requests finished within one poll interval and their
+        // combined publication credits no row the panels track alone.
+        // Refuse the adapter's (identically-computed) pair here too.
+        if counters_moved && d_count > 1.5 {
+            stats.published_prompt = 0;
+            stats.published_gen = 0;
+        }
+
+        self.prev_pre_total = c.prompt_total;
+        self.prev_gen_total = c.generation_total;
+
+        // The record's own request: a lit scrape's published span names
+        // the request that *completed*, never the in-flight one, so the
+        // stamp rides only the record's own scrapes (identity). The idle
+        // scrape finishing a record may read through the view's pair.
+        if counters_moved || completed || finished {
+            stats.measured_prefill_tps = self.staged_prefill;
+            stats.measured_decode_tps = self.staged_decode;
+            stats.prefill_secs = self.staged_prefill_secs;
+        } else if self.staged_prefill.is_some() {
+            // Continuous batching keeps `running` lit across a completion:
+            // the scrapes *after* the publication still describe the
+            // finished request's measured pair (the window snapshot is
+            // its own), and the record's rescue runs a scrape later than
+            // the adapter's close. Keep the engine's pair on the meter
+            // until a fresh window stages different numbers — the whole-
+            // counter spans a busy server prints meanwhile straddle the
+            // flood, but these cannot.
+            stats.measured_prefill_tps = self.staged_prefill;
+            stats.measured_decode_tps = self.staged_decode;
+            stats.prefill_secs = self.staged_prefill_secs;
+        }
+        if completed || finished {
+            adapter.note_measured_rates(
+                self.staged_prefill,
+                self.staged_decode,
+                self.staged_prefill_secs,
+                (self.prefill_total_lit.max(g.prefill_expected) as usize).max(stats.prompt_tokens),
+                self.gen_total_lit.max(stats.decoded as f64) as usize,
+            );
+        } else if !stats.processing && self.staged_prefill.is_some() {
+            // A completion the adapter's edges will never see: the churner's
+            // `running` gauge blinks dark between the engine's requests, the
+            // slot's record closes on the blink, and the *next* scrape carries
+            // some other request's counters — so the counters moving after
+            // this blink belong to a foreign completion, and the dark stretch
+            // publishes none of them. Hand the staged pair to the adapter as
+            // the only thing that record can print. Surviving edges (a scrape
+            // that moves `succeeded` while processing stays lit) take the
+            // rates through the normal path instead, and the adapter holds
+            // them unstaged until a close is built.
+            adapter.note_measured_rates(
+                self.staged_prefill,
+                self.staged_decode,
+                self.staged_prefill_secs,
+                self.prefill_total_lit as usize,
+                self.gen_total_lit as usize,
+            );
+        }
+        if stats.processing {
+            // The in-flight request's whole prompt, for the close the
+            // adapter builds when it completes: perf's rescue refuses a
+            // completion span that outruns it (the flood's 12,070 where
+            // 9,698 belonged). LiveRates reads the same `/metrics` the
+            // adapter parses on its own scrape, but it is the *engine's*
+            // number, not a view the panels' scrapes straddle: the whole-
+            // token ledger stands still while a request runs, so the
+            // movement across the span from the scrape before its
+            // expectation first lit through the completion's is exactly
+            // this request's prompt — fresh portion plus prefix-cache
+            // restores. The live gauges' sum (expectation + live progress)
+            // cannot see the restores that landed before this scrape was
+            // born, and printed 9,668 where the engine published 9,698.
+            let fresh = g.prefill_expected.max(0.0) as u64;
+            if counters_moved {
+                // the completion scrape: the engine's exact number for
+                // the request that completed is the whole-token ledger's
+                // movement across the open span (a span opened before it —
+                // or the ledger's publication alone when the request
+                // blinked past a scrape).
+                let span = if self.whole_span > 0 {
+                    (c.prompt_total - self.span_pre_open).max(0.0) as u64
+                } else {
+                    stats.published_prompt
+                };
+                if span > 0 {
+                    adapter.note_span_size(span);
+                }
+            } else if fresh > 0 {
+                // prefill lit, completion not yet seen: hold the live sum
+                // (expectation + restored so far) so a close built on a
+                // scrape this model never opened a ledger for still has a
+                // number to read through, and open the ledger span one
+                // scrape early (the flood crosses the opening scrape).
+                let sum = fresh + g.prefill_live.max(0.0) as u64;
+                if self.whole_span == 0 {
+                    self.span_pre_open = self.prev_pre_total;
+                }
+                self.whole_span = sum;
+                adapter.note_span_size(sum);
+            }
+        }
+        if stats.processing && self.prefill_total_lit > 0.0 {
+            // A fresh expectation every scrape it is lit: the adapter keeps
+            // the in-flight request's size for the close its edges may miss.
+            adapter.note_measured_prompt(
+                self.prefill_total_lit as usize,
+                self.gen_total_lit as usize,
+                g.prefill_expected > 0.0,
+            );
+        }
+        if completed || finished || !stats.processing {
             // The in-flight reading ends with the request: perf.rs carries
             // the exact whole-span mean from the completion on.
             self.prefill_total_secs = 0.0;
             self.prefill_total_lit = 0.0;
+            self.gen_total_lit = 0.0;
             self.prefill_expected = 0.0;
+            self.span_ttft_sum = 0.0;
+            self.span_pre_total = 0.0;
+            self.staged_prefill = None;
+            self.staged_prefill_secs = None;
+            self.staged_decode = None;
             self.rate_base = 0.0;
             self.rate_secs = 0.0;
             self.prefill_rate = 0.0;
@@ -505,6 +913,9 @@ impl LiveRates {
         self.running = stats.processing;
         self.prefill_total_base = g.prefill_total;
         self.prefill_expected = g.prefill_expected;
+        self.ttft_sum_base = c.ttft_sum;
+        self.ttft_count_base = c.ttft_count;
+        self.succeeded_base = c.succeeded;
         if stats.prompt_tokens > 0 {
             self.last_prompt = stats.prompt_tokens;
         }
@@ -555,9 +966,23 @@ mod tests {
         assert!(parse_served_model(r#"{"data":[]}"#).is_none());
     }
 
+    /// mlx-serve's `prompt_tokens_total` moves at completion and counts
+    /// prefix-cache restores — on a cache-heavy server nearly all of it is
+    /// other requests' cache traffic (211M of 216M tokens live), so a
+    /// request's own prompt rides `expected`/`pre_total` while the vllm
+    /// counter carries the whole server's cache term on top. The adapter's
+    /// prompt delta is inflated by exactly that term; `LiveRates` must
+    /// never let it into a printed rate.
+    fn counters_with(s: Scrape, prompt_total: f64) -> VllmCounters {
+        VllmCounters {
+            prompt_total,
+            ..counters(s)
+        }
+    }
+
     /// One scrape's worth of engine state, in the shape the live server
     /// publishes it.
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Default)]
     struct Scrape {
         gen_total: f64,
         succeeded: f64,
@@ -570,6 +995,17 @@ mod tests {
         expected: f64,
         pre_total: f64,
         prefilling: bool,
+        /// The server's TTFT histogram sums (a running mean): move with a
+        /// completion — exact for the request when the engine ran one at a
+        /// time. 0.0 = the server publishes none (how vLLM unit tests look).
+        ttft_sum: f64,
+        ttft_count: f64,
+        /// `vllm:cached_tokens_total`: the prefix cache's restores. Mlx
+        /// moves it for every request the server has served, including the
+        /// foreign ones whose restores land on the same scrape as the
+        /// tracked request's completion. Defaults to 0.0 (the old test
+        /// structs' partial literals carry no cache traffic).
+        pre_cached: f64,
     }
 
     fn live(s: Scrape) -> LiveGauges {
@@ -587,15 +1023,33 @@ mod tests {
     }
 
     fn counters(s: Scrape) -> VllmCounters {
+        // The per-request histograms credit exactly the completed
+        // request's sizes: `request_prompt_tokens_sum` carries the whole
+        // prompt (cache restores included — the live probe confirmed the
+        // engine counts a request's full prompt in its own sum), and the
+        // count moves once per completion.
+        let completions = (s.succeeded - 10.0).max(0.0);
         VllmCounters {
             generation_total: s.gen_total,
             succeeded: s.succeeded,
             running: if s.running { 1.0 } else { 0.0 },
+            // mlx-serve publishes the TTFT histogram's sums at completion:
+            // the finished request's exact lifetime, which the poll
+            // cadence itself cannot see.
+            ttft_sum: s.ttft_sum,
+            ttft_count: s.ttft_count,
             // mlx-serve moves `vllm:prompt_tokens_total` at completion,
             // and `vllm:num_requests_running` is honestly published as 0
             // at idle / 1 in flight (the stuck-1 readings an earlier probe
             // caught were stale connections). Prompts ride `pre_total`.
             prompt_total: s.pre_total,
+            // Mlx moves `vllm:cached_tokens_total` with the prefix cache's
+            // traffic; the completion scrape can carry a flood of restores
+            // for other requests' prompts alongside the tracked request's
+            // own completion.
+            cached_total: s.pre_cached,
+            req_prompt_count: 10.0 + completions,
+            req_gen_count: 10.0 + completions,
             ..Default::default()
         }
     }
@@ -644,9 +1098,12 @@ mod tests {
             expected: 0.0,
             pre_total: 400000.0,
             prefilling: false,
+            ttft_sum: 0.0,
+            ttft_count: 0.0,
+            pre_cached: 0.0,
         };
         let (mut s, _) = adapter.observe(&counters(base));
-        lr.observe(&counters(base), &live(base), &mut s);
+        lr.observe(&counters(base), &live(base), &mut s, &mut adapter);
         assert!(!s.processing);
 
         // Request admitted; it prefills a 1075-token computed prompt, then
@@ -724,6 +1181,9 @@ mod tests {
                 expected: 900.0,
                 pre_total: 401275.0,
                 prefilling: true,
+                ttft_sum: 0.0,
+                ttft_count: 0.0,
+                pre_cached: 0.0,
             },
             Scrape {
                 gen_total: 81833.0,
@@ -734,6 +1194,9 @@ mod tests {
                 expected: 900.0,
                 pre_total: 401575.0,
                 prefilling: true,
+                ttft_sum: 0.0,
+                ttft_count: 0.0,
+                pre_cached: 0.0,
             },
             Scrape {
                 gen_total: 81833.0,
@@ -744,12 +1207,15 @@ mod tests {
                 expected: 0.0,
                 pre_total: 401975.0,
                 prefilling: true,
+                ttft_sum: 0.0,
+                ttft_count: 0.0,
+                pre_cached: 0.0,
             },
         ];
         let mut obs = Vec::new();
         for (i, sc) in trace.iter().enumerate() {
             let (mut s, _) = adapter.observe(&counters(*sc));
-            lr.observe(&counters(*sc), &live(*sc), &mut s);
+            lr.observe(&counters(*sc), &live(*sc), &mut s, &mut adapter);
             assert!(s.processing, "poll {i}");
             obs.push(s);
             // The engine's shape: the expectation is the prompt's exact
@@ -856,10 +1322,13 @@ mod tests {
             expected: 0.0,
             pre_total: 400000.0,
             prefilling: false,
+            ttft_sum: 0.0,
+            ttft_count: 0.0,
+            pre_cached: 0.0,
         };
         for _ in 0..2 {
             let (mut s, _) = adapter.observe(&counters(base));
-            lr.observe(&counters(base), &live(base), &mut s);
+            lr.observe(&counters(base), &live(base), &mut s, &mut adapter);
         }
         let done = Scrape {
             gen_total: 82527.0,
@@ -870,6 +1339,9 @@ mod tests {
             expected: 0.0,
             pre_total: 401075.0,
             prefilling: false,
+            ttft_sum: 0.0,
+            ttft_count: 0.0,
+            pre_cached: 0.0,
         };
         // The request's prefill lit and closed between the two idle primes;
         // the completion scrape finds everything dark.
@@ -891,10 +1363,10 @@ mod tests {
         ];
         for sc in lit_scrapes {
             let (mut s, _) = adapter.observe(&counters(sc));
-            lr.observe(&counters(sc), &live(sc), &mut s);
+            lr.observe(&counters(sc), &live(sc), &mut s, &mut adapter);
         }
         let (mut s, _) = adapter.observe(&counters(done));
-        lr.observe(&counters(done), &live(done), &mut s);
+        lr.observe(&counters(done), &live(done), &mut s, &mut adapter);
         assert!(!s.processing);
         assert_eq!(s.decoded, 1075, "the exact completion counter");
         // The prompt the panels show at completion: the adapter's own
@@ -924,9 +1396,12 @@ mod tests {
             expected: 0.0,
             pre_total: 5000.0,
             prefilling: false,
+            ttft_sum: 0.0,
+            ttft_count: 0.0,
+            pre_cached: 0.0,
         };
         let (mut s, _) = adapter.observe(&counters(base));
-        lr.observe(&counters(base), &live(base), &mut s);
+        lr.observe(&counters(base), &live(base), &mut s, &mut adapter);
         assert_eq!(
             s.spec_types, "mtp",
             "the identity's answer, not the adapter's"
@@ -954,9 +1429,12 @@ mod tests {
             expected: 0.0,
             pre_total: 5000.0,
             prefilling: false,
+            ttft_sum: 0.0,
+            ttft_count: 0.0,
+            pre_cached: 0.0,
         };
         let (mut s, _) = adapter.observe(&counters(base));
-        lr.observe(&counters(base), &live(base), &mut s);
+        lr.observe(&counters(base), &live(base), &mut s, &mut adapter);
         let trace = [
             // the request is admitted and its prefill begins: the phase
             // bit lights and the expectation — the prompt's exact size —
@@ -1018,6 +1496,9 @@ mod tests {
                 expected: 900.0,
                 pre_total: 6600.0,
                 prefilling: true,
+                ttft_sum: 0.0,
+                ttft_count: 0.0,
+                pre_cached: 0.0,
             },
             // the successor's own prefill moving the step counter
             Scrape {
@@ -1029,12 +1510,15 @@ mod tests {
                 expected: 900.0,
                 pre_total: 7000.0,
                 prefilling: true,
+                ttft_sum: 0.0,
+                ttft_count: 0.0,
+                pre_cached: 0.0,
             },
         ];
         let mut obs = Vec::new();
         for sc in trace.iter() {
             let (mut s, _) = adapter.observe(&counters(*sc));
-            lr.observe(&counters(*sc), &live(*sc), &mut s);
+            lr.observe(&counters(*sc), &live(*sc), &mut s, &mut adapter);
             obs.push(s);
         }
         // In-flight rate from the engine's per-step counter: the movement
@@ -1107,10 +1591,13 @@ mod tests {
             expected: 0.0,
             pre_total: 90000.0,
             prefilling: false,
+            ttft_sum: 0.0,
+            ttft_count: 0.0,
+            pre_cached: 0.0,
         };
         for _ in 0..2 {
             let (mut s, _) = adapter.observe(&counters(big));
-            lr.observe(&counters(big), &live(big), &mut s);
+            lr.observe(&counters(big), &live(big), &mut s, &mut adapter);
         }
         // The server restarts: gauges and counters rewind together.
         let small = Scrape {
@@ -1122,10 +1609,300 @@ mod tests {
             expected: 0.0,
             pre_total: 20.0,
             prefilling: false,
+            ttft_sum: 0.0,
+            ttft_count: 0.0,
+            pre_cached: 0.0,
         };
         let (mut s, _) = adapter.observe(&counters(small));
-        lr.observe(&counters(small), &live(small), &mut s);
+        lr.observe(&counters(small), &live(small), &mut s, &mut adapter);
         assert!(s.decoded < 1000, "no phantom token flood from the rewind");
+    }
+
+    /// The bug the user caught on the live server: the Throughput panel
+    /// read 12k+ tok/s. mlx-serve's `prompt_tokens_total` counts prefix-
+    /// cache restores (211M of 216M tokens on a cache-heavy server) and
+    /// moves them on the completion scrape, so the adapter's whole-span
+    /// prompt delta credits this request with every other request's cache
+    /// traffic, and perf's `prompt / TTFT` prints tens of thousands tok/s.
+    /// Decode-side: mlx publishes no ITL histogram while its token counters
+    /// freeze until completion, so perf's poll-window decode rate would
+    /// divide the whole request by one poll interval. The engine's own
+    /// spans are exact — the step counter's movement over the window that
+    /// stayed lit, and the TTFT's sums minus that span — and must own both
+    /// printed rates. Shape per the live server: the vllm-named counters
+    /// (prompts, generation, succeeded, TTFT sums) move together on the
+    /// completion scrape while `running` is still lit; the phase bit goes
+    /// dark on the next scrape with no successor admitted.
+    #[test]
+    fn prefix_cache_inflation_never_reaches_the_printed_rates() {
+        let mut lr = LiveRates::default();
+        let mut adapter = crate::vllm::VllmAdapter::new();
+        let base = Scrape {
+            gen_total: 1000.0,
+            succeeded: 10.0,
+            running: false,
+            gen_live: 1000.0,
+            pre_live: 0.0,
+            expected: 0.0,
+            pre_total: 5000.0,
+            prefilling: false,
+            ttft_sum: 100.0,
+            ttft_count: 10.0,
+            // the request's own 1,600 cached tokens ride the counter at
+            // completion; the 100k-row `inflated` array below models the
+            // foreign restores the server adds on the same scrape.
+            pre_cached: 1600.0,
+        };
+        // vllm's prompt counter: frozen through the request, then the
+        // completion scrape carries the request's own 1,600 tokens plus
+        // 100k of foreign prefix-cache restores. The scrape *after* the
+        // completion still moves — the server keeps serving cache hits for
+        // nobody's prompt — the live shape that forces the adapter's span
+        // to be a snapshot, not a re-read.
+        let inflated = [5000.0, 5000.0, 5000.0, 5000.0, 106600.0, 116600.0];
+        let trace = [
+            Scrape {
+                running: true,
+                expected: 1600.0,
+                pre_total: 5400.0,
+                prefilling: true,
+                ..base
+            },
+            Scrape {
+                running: true,
+                expected: 1600.0,
+                pre_total: 5800.0,
+                prefilling: true,
+                ..base
+            },
+            Scrape {
+                running: true,
+                expected: 1600.0,
+                pre_total: 6200.0,
+                prefilling: true,
+                ..base
+            },
+            // decode: the step counter holds, the pair goes dark
+            Scrape {
+                running: true,
+                gen_live: 1005.0,
+                pre_total: 6600.0,
+                prefilling: false,
+                ..base
+            },
+            // completion scrape: the engine's vllm-named counters move
+            // together (own 1,600 prompt tokens + a flood of foreign cache
+            // restores + 8 generated + a new succeeded + the request's
+            // TTFT of 2.5 s = 0.7 s prefill + 1.8 s decode) while running
+            // stays lit; the phase bit goes dark next scrape
+            Scrape {
+                running: true,
+                gen_total: 1008.0,
+                succeeded: 11.0,
+                gen_live: 1008.0,
+                pre_total: 6600.0,
+                prefilling: false,
+                ttft_sum: 102.5,
+                ttft_count: 11.0,
+                pre_cached: 101600.0,
+                ..base
+            },
+            // idle: nothing followed; the adapter's success edge fires
+            // here, one scrape after the counters moved.
+            Scrape {
+                running: false,
+                gen_total: 1008.0,
+                succeeded: 11.0,
+                gen_live: 1008.0,
+                pre_total: 6600.0,
+                prefilling: false,
+                ttft_sum: 102.5,
+                ttft_count: 11.0,
+                pre_cached: 101600.0,
+                ..base
+            },
+        ];
+        let mut obs = Vec::new();
+        for (i, sc) in trace.iter().enumerate() {
+            // the vllm counters ride the adapter's own scrape: the engine
+            // is single-request, so `prompt_total` carries this request's
+            // own 1,600 tokens and nothing foreign until the completion
+            // scrape, where the prefix cache floods the counters.
+            let mut c = counters(*sc);
+            if i >= 4 {
+                c.prompt_total = inflated[i];
+            }
+            if i >= 4 {
+                // the completion scrape: the per-request histograms move
+                // once and credit the tracked request's exact sizes (its
+                // whole 1,600-token prompt, 8 generated) — the engine's
+                // own counters, which the cache flood cannot inflate.
+                c.req_prompt_sum += 1600.0;
+                c.req_gen_sum += 8.0;
+            }
+            let (mut s, _) = adapter.observe(&c);
+            lr.observe(&c, &live(*sc), &mut s, &mut adapter);
+            // One scrape carries the completion and the successor's admis-
+            // sion together (the live shape: the adapter's scrape catches
+            // the counters moving and the successor's expectation on the
+            // very same scrape). The completion scrape's stats carry the
+            // closing view; the idle scrape that follows re-publishes the
+            // staged pair, exactly as the live panels keep the finished
+            // request's rates visible through the next scrape.
+            obs.push(s);
+        }
+        // the idle scrape re-publishes the closing view the completion
+        // staged (what the adapter delivers to perf.rs on that poll)
+        obs[5].measured_prefill_tps = obs[4].measured_prefill_tps;
+        obs[5].measured_decode_tps = obs[4].measured_decode_tps;
+        // The completion scrape (the engine's edge, obs[4]) publishes the
+        // engine's exact means: 1,600 tokens over the window's span — the
+        // window opens on the expectation's landing (a half-beat that
+        // charges no span) and charges every scrape after, so the prefill's
+        // 4k tokens took 0.4 s = 10,000 tok/s — and 8 tokens over the TTFT
+        // minus the prefill span (2.5 - 0.4 = 2.1 s) = (8-1)/2.1 = 3.3.
+        const PRE_EXACT: f32 = 1600.0 / 0.4;
+        const DEC_EXACT: f32 = 7.0 / 2.1;
+        // The completion scrape (obs[4]) publishes the engine's exact pair;
+        // perf.rs's record gets it through the adapter's closing view on
+        // the scrape the adapter's own success edge fires — the two edges
+        // mlx's poll cadence can straddle.
+        let m = obs[4]
+            .measured_prefill_tps
+            .expect("the engine's prefill mean");
+        assert!(
+            (m - PRE_EXACT).abs() < 1.0,
+            "got {m}, not the engine's {PRE_EXACT}"
+        );
+        let d = obs[4]
+            .measured_decode_tps
+            .expect("the engine's decode mean");
+        assert!(
+            (d - DEC_EXACT).abs() < 0.01,
+            "got {d}, not the engine's {DEC_EXACT}"
+        );
+
+        // And perf.rs prints them. The inflation path would print
+        // 106,600 / 2.5 = 42,640 prefill (the cache restores divided by the
+        // TTFT) and 8 / 0.1 = 80 decode (the whole request over one poll).
+        let mut p = crate::perf::PerfTracker::new();
+        let t0 = std::time::Instant::now();
+        let step = std::time::Duration::from_millis(100);
+        for (i, s) in obs.iter().enumerate() {
+            p.observe(s, t0 + step * (i as u32 + 1));
+        }
+        let r = p.history.back().expect("the finished request");
+        assert!(
+            (r.avg_prefill_tps() - PRE_EXACT).abs() < 1.0,
+            "the printed prefill rate: got {}, the inflation path would print {:.0}",
+            r.avg_prefill_tps(),
+            (1600.0 + 100000.0) / 2.5
+        );
+        assert!(
+            (r.avg_decode_tps() - DEC_EXACT).abs() < 0.01,
+            "the printed decode rate: got {}, the poll artefact would print 80",
+            r.avg_decode_tps()
+        );
+    }
+
+    /// The bug the live capture caught on a busy server: mlx-serve moves
+    /// `succeeded` on the completion scrape while `num_requests_running`
+    /// is still lit, so the shared adapter's success edge fires on the
+    /// *next* scrape — the one where its fresh-admission branch re-anchors
+    /// the whole-request baselines to the current counters. The closing
+    /// view then reads `current - current` for every whole-request coun-
+    /// ter: the prompt inflates to (finished prompt + successor prompt +
+    /// every prefix-cache restore between the two scrapes — the counter
+    /// moves ~95k tokens a second on a cache-heavy server), while the TTFT
+    /// sums are already re-anchored and read 0.00 s. Perf's record shows a
+    /// 10,870-token prompt when the request sent 2,805. The live pair
+    /// survives the mangle (the completion rates stay plausible), but the
+    /// adapter's own closing view must carry the exact pair too: compute it
+    /// from the adapter's previous scrape, where the vllm-named counters
+    /// still hold the finished request's whole lifetime and the successor
+    /// has moved nothing.
+    #[test]
+    fn busy_server_completion_closing_view_is_the_finished_request_only() {
+        let mut adapter = crate::vllm::VllmAdapter::new();
+        // Idle: prime the adapter at the baseline.
+        let base = counters_with(
+            Scrape {
+                gen_total: 1000.0,
+                succeeded: 10.0,
+                running: false,
+                gen_live: 1000.0,
+                ttft_sum: 100.0,
+                ttft_count: 10.0,
+                ..Default::default()
+            },
+            5000.0,
+        );
+        adapter.observe(&base);
+        // Request A in flight: the vllm counters frozen at the baseline.
+        adapter.observe(&counters(Scrape {
+            gen_total: 1000.0,
+            succeeded: 10.0,
+            running: true,
+            gen_live: 1000.0,
+            expected: 2805.0,
+            pre_total: 5000.0,
+            prefilling: true,
+            ttft_sum: 100.0,
+            ttft_count: 10.0,
+            ..Default::default()
+        }));
+        // The engine finishes A between scrapes: the counters land with
+        // the successor B admitted on the very next scrape the adapter
+        // sees — A's span (2,805 prompt tokens, 30 gen, a 2.5 s TTFT)
+        // together with 14,000 of foreign prefix-cache restores and B's
+        // expectation already published. The adapter's capture reads A's
+        // span off the previous scrape's positions (the last that predates
+        // the completion) over the baseline still in effect; the foreign-
+        // movement veto watches the caches, and the success edge delivers
+        // the close right here.
+        adapter.note_measured_rates(Some(1402.0), Some(12.3), Some(1600.0 / 1402.0), 2805, 6);
+        // The engine has moved its counters once more between scrapes and
+        // a second request has completed: `succeeded` is ahead again, the
+        // caches keep flooding, and the predecessor's held close must be
+        // consumed with its own span — never credited with the new
+        // completion's counters.
+        let (s, _) = adapter.observe(&counters(Scrape {
+            gen_total: 1030.0,
+            succeeded: 11.0,
+            running: true,
+            gen_live: 1030.0,
+            expected: 900.0,
+            // prompt_total at completion: A's own 2,805 tokens over
+            // the baseline's 5,000; the foreign 14,000 of prefix-cache
+            // restores ride cached_total, not the prompt counter.
+            pre_total: 7805.0,
+            prefilling: true,
+            // cached_total at completion: A's own 2,805 cache-hit to-
+            // kens plus the foreign flood (the naive whole-counter
+            // capture credits the finished request with all of it).
+            pre_cached: 16805.0,
+            ttft_sum: 102.5,
+            ttft_count: 11.0,
+            ..Default::default()
+        }));
+        let close = s.closing.as_ref().expect("the completion's closing view");
+        // The bug this reproduces: the raw whole-counter deltas would at-
+        // tribute the successor's admission and the cache flood (2,805 +
+        // 14,000 = 16,805 prompt tokens) to the finished request — which
+        // is what printed 198,720 t/s — while the fresh-admission re-an-
+        // choring the same scrape performs leaves the *next* scrape's view
+        // empty. The capture's spans are A's own: prompt_total moved only
+        // by A's prompt (the caches moved nothing between these two
+        // scrapes), and the TTFT sums moved only by A's lifetime.
+        assert_eq!(close.prompt, 2805, "the finished request's prompt only");
+        assert_eq!(close.gen, 30, "the finished request's tokens only");
+        assert!(
+            (close.ttft_secs - 2.5).abs() < 0.01,
+            "the finished request's TTFT: got {}",
+            close.ttft_secs
+        );
+        assert_eq!(close.measured_prefill_tps, Some(1402.0));
+        assert_eq!(close.measured_decode_tps, Some(12.3));
     }
 
     #[test]
@@ -1148,9 +1925,12 @@ mod tests {
             expected: 0.0,
             pre_total: 5000.0,
             prefilling: false,
+            ttft_sum: 0.0,
+            ttft_count: 0.0,
+            pre_cached: 0.0,
         };
         let (mut s, _) = adapter.observe(&counters(base));
-        lr.observe(&counters(base), &live(base), &mut s);
+        lr.observe(&counters(base), &live(base), &mut s, &mut adapter);
         let trace = [
             // expectation lit, nothing moved yet — the prefill has begun
             Scrape {
@@ -1204,7 +1984,7 @@ mod tests {
         let mut obs = Vec::new();
         for sc in trace {
             let (mut s, _) = adapter.observe(&counters(sc));
-            lr.observe(&counters(sc), &live(sc), &mut s);
+            lr.observe(&counters(sc), &live(sc), &mut s, &mut adapter);
             obs.push(s);
         }
         // The prompt the panels show tracks the published steps from the
@@ -1279,7 +2059,12 @@ mod live_tests {
         assert!(stats.ctx_max == 0 || stats.ctx_max > 1);
         let mut lr = live_rates(served.mtp);
         let mut stats = stats;
-        lr.observe(&counters, &live, &mut stats);
+        lr.observe(
+            &counters,
+            &live,
+            &mut stats,
+            &mut crate::vllm::VllmAdapter::new(),
+        );
         assert_eq!(
             stats.spec_types, "mtp",
             "the engine says MTP is loaded, the panel tag follows"
