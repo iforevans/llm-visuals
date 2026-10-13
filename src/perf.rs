@@ -744,15 +744,38 @@ impl PerfTracker {
                     // flood, not the request.
                     let named = if close.exact_prompt > 0 {
                         close.exact_prompt.min(close_prompt as u64)
-                    } else if close.published_prompt > 0 && one_completion {
-                        close.published_prompt.min(close_prompt as u64)
+                    } else if one_completion {
+                        if close.published_prompt > 0 {
+                            close.published_prompt.min(close_prompt as u64)
+                        } else if close.prompt > 0 {
+                            // Plain vLLM's whole-window prompt, under the
+                            // published-span ceiling: exactly one
+                            // completion moved this window.
+                            close_prompt as u64
+                        } else {
+                            0
+                        }
                     } else {
                         0
                     };
                     let named_gen = if close.exact_gen > 0 {
                         close.exact_gen
+                    } else if one_completion {
+                        // The published pair when it speaks; a plain
+                        // vLLM close names no pair at all yet its
+                        // window still brackets exactly one request, so
+                        // the close's own whole-window gen is that
+                        // request's. On mlx the adapter has already
+                        // refused flood-sized pairs (the completion count
+                        // gates the published fields), so one_completion
+                        // means the bracket is honest either way.
+                        if close.published_gen > 0 {
+                            close.published_gen
+                        } else {
+                            close.gen as u64
+                        }
                     } else {
-                        close.published_gen
+                        0
                     };
                     let named_pre = named.saturating_sub(close.cached as u64);
                     if named > 0 {
@@ -786,7 +809,17 @@ impl PerfTracker {
                         done.prompt_tokens = close_prompt;
                         done.cached_tokens = close.cached.min(close_prompt);
                         done.prefill_tokens = close_prompt.saturating_sub(close.cached);
-                        done.decoded = close.gen;
+                        // Gen: the exact pair when it speaks; the
+                        // published pair when exactly one completion
+                        // moved it; the close's own whole-window gen for
+                        // engines that publish no pair (plain vLLM).
+                        done.decoded = if named_gen > 0 {
+                            named_gen as usize
+                        } else if one_completion || close.published_completions == 0 {
+                            close.gen
+                        } else {
+                            0
+                        };
                         if close.ttft_secs > 0.0 {
                             done.ttft = Some(close.ttft_secs as f32);
                         }
@@ -809,7 +842,9 @@ impl PerfTracker {
                         done.prompt_tokens = s.prompt_processed;
                         done.cached_tokens = done.cached_tokens.min(done.prompt_tokens);
                         done.prefill_tokens = done.prompt_tokens - done.cached_tokens;
-                        if close.gen > done.decoded {
+                        if (one_completion || close.published_completions == 0)
+                            && close.gen > done.decoded
+                        {
                             self.session_decoded += (close.gen - done.decoded) as u64;
                             done.decoded = close.gen;
                         }
@@ -836,10 +871,13 @@ impl PerfTracker {
                                 .session_prefilled
                                 .saturating_sub(done.prefill_tokens as u64)
                                 .saturating_add(tokens as u64);
-                            self.session_decoded += close.gen.saturating_sub(done.decoded) as u64;
                             done.prompt_tokens = close_prompt;
                             done.cached_tokens = close.cached.min(close_prompt);
-                            done.decoded = done.decoded.max(close.gen);
+                            if one_completion || close.published_completions == 0 {
+                                self.session_decoded +=
+                                    close.gen.saturating_sub(done.decoded) as u64;
+                                done.decoded = done.decoded.max(close.gen);
+                            }
                             done.set_prefill_timing(tokens, secs);
                         }
                         if let Some(rate) = close.measured_prefill_tps {
@@ -882,26 +920,9 @@ impl PerfTracker {
                     if close.itl_sum > 0.0 {
                         done.itl_sum = Some(close.itl_sum as f32);
                     }
-                    // Physical ceiling: P prompt tokens in T seconds of
-                    // measured TTFT cannot beat P/T — the row's printed
-                    // rate reads back through the span it finally took.
-                    if let (Some(ttft), true) = (done.ttft, done.prompt_tokens > 1) {
-                        if ttft > 0.0 {
-                            let ceiling = done.prompt_tokens as f32 / ttft;
-                            if let Some(rate) = done.measured_prefill_tps {
-                                if rate > ceiling {
-                                    // An engine-measured rate is not a
-                                    // fabrication: a span estimate that
-                                    // outruns it divided a window the
-                                    // engine never published. Keep the
-                                    // engine's own mean.
-                                    if done.prefill_secs == 0.0 {
-                                        done.measured_prefill_tps = Some(ceiling);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    // Physical ceilings: the row's printed rates read
+                    // back through the spans the engine finally named.
+                    Self::clamp_record(&mut done);
                 }
                 // Unconditional: only the corrections above are gated on
                 // a closing view — a record without one must still stop
@@ -1247,22 +1268,14 @@ impl PerfTracker {
                     cur.decoded = exact_gen as usize;
                 }
             }
-            // Physical ceiling on whatever rate the record carries: P
-            // prompt tokens in T seconds of measured TTFT cannot beat
-            // P/T. Applies on every scrape — the completion's stamped
-            // stats go stale under continuous batching (the next poll
-            // already belongs to the successor), and a row that printed
-            // the flood's rate before its close must read back through
-            // the exact counts the moment they land.
-            if let (Some(ttft), true) = (cur.ttft, exact_prompt > 0) {
-                if ttft > 0.0 {
-                    let ceiling = exact_prompt as f32 / ttft;
-                    if let Some(rate) = cur.measured_prefill_tps {
-                        if rate > ceiling {
-                            cur.measured_prefill_tps = Some(ceiling);
-                        }
-                    }
-                }
+            // Physical ceilings on whatever rates the record carries.
+            // Applies on every scrape — the completion's stamped stats
+            // go stale under continuous batching (the next poll already
+            // belongs to the successor), and a row that printed the
+            // flood's rate before its close must read back through the
+            // exact counts the moment they land.
+            if exact_prompt > 0 || s.exact_gen > 0 {
+                Self::clamp_record(cur);
             }
             if !s.processing {
                 let mut done = self.current.take().unwrap();
@@ -1282,6 +1295,48 @@ impl PerfTracker {
         }
 
         self.last_sample = Some((now, s.clone()));
+    }
+
+    /// Physical ceilings on whatever rates a record carries: P prompt
+    /// tokens in T seconds of measured TTFT cannot beat P/T, and G
+    /// tokens cannot decode faster than G over the engine's decode span
+    /// (TTFT minus the measured prefill; the ITL sum where the engine
+    /// publishes one). A rate that outruns its span divided a window the
+    /// engine never published for this request — the flood's 700,832 t/s
+    /// row rode an untracked close whose span was a poll interval, and a
+    /// stale in-flight reading from such a window paints rows until the
+    /// record finishes. Every path that stamps a measured rate applies
+    /// these walls.
+    fn clamp_record(r: &mut RequestRecord) {
+        if let Some(ttft) = r.ttft {
+            if ttft > 0.0 && r.prompt_tokens > 1 {
+                if let Some(rate) = r.measured_prefill_tps {
+                    let ceiling = r.prompt_tokens as f32 / ttft;
+                    if rate > ceiling {
+                        r.measured_prefill_tps = Some(ceiling);
+                    }
+                }
+            }
+            if r.decoded > 1 {
+                // The engine's decode span: the ITL sum where the engine
+                // publishes that histogram (plain vLLM), else TTFT minus
+                // the measured prefill span.
+                let decode_secs = r.itl_sum.map(|t| t as f64).or_else(|| {
+                    let pre = ttft as f64 - r.prefill_secs as f64;
+                    (pre > 0.0).then_some(pre)
+                });
+                if let Some(secs) = decode_secs {
+                    if secs > 0.05 {
+                        if let Some(rate) = r.measured_decode_tps {
+                            let ceiling = (r.decoded - 1) as f32 / secs as f32;
+                            if rate > ceiling {
+                                r.measured_decode_tps = Some(ceiling);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn finish(&mut self, mut r: RequestRecord) {
@@ -1544,8 +1599,12 @@ mod tests {
                     published_prompt: 0,
                     published_gen: 0,
                     published_completions: 1,
-                    span_known: 0,
-                    exact_prompt: 0,
+                    // The close names its request whole (what the
+                    // adapter's honesty gate now guarantees for every
+                    // close that carries spans): the rescue's substitution
+                    // clamps to this ceiling.
+                    span_known: 1000,
+                    exact_prompt: 1000,
                     exact_gen: 0,
                 }),
             ),
