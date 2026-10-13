@@ -850,6 +850,12 @@ impl PerfTracker {
                         }
                     }
                     if let Some(rate) = close.measured_prefill_tps {
+                        // The rate model freezes only at completion: a
+                        // row that printed an in-flight reading before
+                        // its close reads back through the engine's own
+                        // mean whatever ledger named the spans. (The
+                        // adapter has already blanked an untracked
+                        // close's rates: nothing here to veto.)
                         done.measured_prefill_tps = Some(rate);
                     }
                     if let Some(rate) = close.measured_decode_tps {

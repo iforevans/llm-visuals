@@ -285,6 +285,16 @@ pub struct LiveRates {
     succeeded_base: f64,
     span_ttft_sum: f64,
     span_pre_total: f64,
+    /// The tracked window opened before `prompt_tokens_total` moved under
+    /// a *tracked* completion (one completion since the last scrape). A
+    /// completion-edge close built on a scrape with this false absorbed
+    /// publications the panels never opened rows for: the churner's flood
+    /// moves the whole-token ledger ~2,800 tokens every ~0.1s, and a
+    /// window opened between two churner completions divides one
+    /// request's prefill steps by a fraction of its own span — the
+    /// 854,590 t/s / 2,620 t/s rows. Such a close carries no measured
+    /// rates or span at all.
+    span_tracked: bool,
     /// The request's exact means, computed on the scrape its vllm-named
     /// counters moved (the engine's completion, which the adapter's `run-
     /// ning` may still read lit for one more poll): both the panel's
@@ -297,6 +307,19 @@ pub struct LiveRates {
     /// engine-published rate and any reconstruction share one denominator.
     staged_prefill_secs: Option<f64>,
     staged_decode: Option<f32>,
+    /// Whether the scrapes' rate pair is on air (the window opened or
+    /// completed under a tracked request). The panel's in-flight line
+    /// *holds* a published reading across dark beats, so an edge that
+    /// names no request must zero the pair rather than let the last
+    /// reading keep painting successor rows.
+    rates_live: bool,
+    /// Whether the staged triple describes the request the panels are
+    /// tracking: only a window that closed under exactly one completion
+    /// names a request. A close built while this is false carries no
+    /// rates (the flood's 854,590 t/s rows: foreign completions crossed
+    /// the window, so its step-counter span divided the tracked
+    /// request's prefill steps by a slice of their time).
+    staged_tracked: bool,
     /// Detection's answer from the engine's `/v1/models`: the model carries
     /// MTP layers and the engine says they are available. mlx-serve pub-
     /// lishes no speculative counters, so the shared adapter's identity
@@ -316,6 +339,7 @@ impl Default for LiveRates {
             span_known: 0,
             whole_span: 0,
             span_pre_open: 0.0,
+            span_tracked: false,
             engine_was_dark: true,
             prev_pre_total: 0.0,
             prev_gen_total: 0.0,
@@ -335,6 +359,8 @@ impl Default for LiveRates {
             staged_prefill: None,
             staged_prefill_secs: None,
             staged_decode: None,
+            rates_live: false,
+            staged_tracked: false,
             mtp: false,
         }
     }
@@ -377,6 +403,17 @@ impl LiveRates {
         }
 
         let lit = g.prefill_expected > 0.0 || g.prefill_live > 0.0;
+        // The engine-published pair is computed here (on the completion
+        // edge) but travels to the adapter's close on a *later* edge
+        // (`completed`/`finished`, below). Carries whether the window
+        // closing on this scrape saw exactly one completion: under
+        // continuous batching the engine finishes foreign requests
+        // inside the tracked request's window, and a completion-edge close
+        // built without one absorbed a publication the panels never opened
+        // a row for — its step-counter span is a slice of the request's
+        // true prefill (the flood's 854,590 t/s rows), so no measured
+        // rate may ride such a close.
+        let mut pair_tracked = false;
         let completed = stats.processing && !self.running;
         // mlx reveals completion via its vllm-named counters moving while
         // the adapter's `running` may stay lit one more poll.
@@ -455,6 +492,7 @@ impl LiveRates {
                 self.staged_prefill = None;
                 self.staged_prefill_secs = None;
                 self.staged_decode = None;
+                self.rates_live = false;
                 self.prefill_rate = 0.0;
                 // A fresh request's prompt memory starts fresh: the pre-
                 // vious request's lit peak must never masquerade as this
@@ -483,6 +521,7 @@ impl LiveRates {
                 self.staged_prefill = None;
                 self.staged_prefill_secs = None;
                 self.staged_decode = None;
+                self.rates_live = false;
                 self.prefill_rate = 0.0;
                 // Same half-beat rule as the expectation's landing: the
                 // phase bit flips between polls, so the opening scrape
@@ -697,17 +736,17 @@ impl LiveRates {
             // `(tokens, rate)`: the engine's whole-request prefill.
             let prefill_pair = if span > 0.0 {
                 let moved = (g.prefill_total - self.span_pre_total).max(0.0);
-                // The finishing request's published prompt size: the
-                // window's lit peak, or the engine's own movement. The
-                // gauges' expectation on *this* scrape belongs to whoever
-                // the engine is publishing right now — a completion scrape
-                // can already carry the successor's request — so the
-                // window's own memory of the request's size is the only
-                // safe source.
+                // The finishing request's published prompt size, and how
+                // many completions crossed the span.
                 let tokens = self.prefill_total_lit.max(moved);
-                if tokens > 0.0 {
+                if tokens > 0.0 && d_count == 1.0 {
                     Some((tokens, tokens / span))
                 } else {
+                    // A window that closes across no completion (or a
+                    // batch of them) measured no single request's prefill:
+                    // the engine finished someone else's request inside
+                    // this window, and this window's steps belong to a
+                    // request that will close in a window of its own.
                     None
                 }
             } else {
@@ -745,9 +784,26 @@ impl LiveRates {
                 }
                 _ => None,
             };
+            // The staged pair names one request only when exactly one
+            // completion crossed the window (`prefill_pair` is None
+            // otherwise, which clears the stage below).
+            pair_tracked = d_count == 1.0;
             self.staged_prefill = prefill_pair.map(|(_tokens, rate)| rate as f32);
             self.staged_prefill_secs = prefill_pair.map(|(tokens, rate)| tokens / rate);
             self.staged_decode = decode_rate;
+            self.staged_tracked = pair_tracked && prefill_pair.is_some();
+            self.rates_live = true;
+        } else if completed || counters_moved {
+            // An edge that computed no pair (no window open, or one that
+            // closed across zero or several completions): nothing new is
+            // staged, and whatever older scrapes staged belongs to no
+            // close this scrape's edge may build.
+            pair_tracked = false;
+            self.staged_prefill = None;
+            self.staged_prefill_secs = None;
+            self.staged_decode = None;
+            self.staged_tracked = false;
+            self.rates_live = false;
         }
         // The whole-token counters' pair (`published_prompt`/`published_
         // gen`): the adapter computes the deltas over its own two scrapes
@@ -798,9 +854,16 @@ impl LiveRates {
         // stamp rides only the record's own scrapes (identity). The idle
         // scrape finishing a record may read through the view's pair.
         if counters_moved || completed || finished {
-            stats.measured_prefill_tps = self.staged_prefill;
-            stats.measured_decode_tps = self.staged_decode;
-            stats.prefill_secs = self.staged_prefill_secs;
+            stats.measured_prefill_tps = self.staged_prefill.filter(|_| self.staged_tracked);
+            stats.measured_decode_tps = self.staged_decode.filter(|_| self.staged_tracked);
+            stats.prefill_secs = self.staged_prefill_secs.filter(|_| self.staged_tracked);
+            if !self.staged_tracked {
+                // The pair is off air: an edge that names no request
+                // zeroes the meter (a held reading would keep painting
+                // successor rows as the adapter's stats-level stamp
+                // preserve-on-None carries it forward).
+                self.rates_live = false;
+            }
         } else if self.staged_prefill.is_some() {
             // Continuous batching keeps `running` lit across a completion:
             // the scrapes *after* the publication still describe the
@@ -809,20 +872,33 @@ impl LiveRates {
             // the adapter's close. Keep the engine's pair on the meter
             // until a fresh window stages different numbers — the whole-
             // counter spans a busy server prints meanwhile straddle the
-            // flood, but these cannot.
-            stats.measured_prefill_tps = self.staged_prefill;
-            stats.measured_decode_tps = self.staged_decode;
-            stats.prefill_secs = self.staged_prefill_secs;
+            // flood, but a *tracked* pair cannot: only a window that
+            // closed under exactly one completion names a request.
+            stats.measured_prefill_tps = self.staged_prefill.filter(|_| self.staged_tracked);
+            stats.measured_decode_tps = self.staged_decode.filter(|_| self.staged_tracked);
+            stats.prefill_secs = self.staged_prefill_secs.filter(|_| self.staged_tracked);
+        }
+        if !self.rates_live {
+            // no tracked pair on air: the adapter's own stats-level
+            // stamp (preserve-on-None) must carry nothing either.
+            stats.measured_prefill_tps = None;
+            stats.measured_decode_tps = None;
+            stats.prefill_secs = None;
         }
         if completed || finished {
+            // An untracked pair (no completion crossed the window, or a
+            // batch of them) describes no request the panels opened: the
+            // adapter's close then reads through the live-gauge span
+            // alone, blank on the rate fields.
+            let tracked = self.staged_tracked;
             adapter.note_measured_rates(
-                self.staged_prefill,
-                self.staged_decode,
-                self.staged_prefill_secs,
+                self.staged_prefill.filter(|_| tracked),
+                self.staged_decode.filter(|_| tracked),
+                self.staged_prefill_secs.filter(|_| tracked),
                 (self.prefill_total_lit.max(g.prefill_expected) as usize).max(stats.prompt_tokens),
                 self.gen_total_lit.max(stats.decoded as f64) as usize,
             );
-        } else if !stats.processing && self.staged_prefill.is_some() {
+        } else if !stats.processing && self.staged_prefill.is_some() && self.staged_tracked {
             // A completion the adapter's edges will never see: the churner's
             // `running` gauge blinks dark between the engine's requests, the
             // slot's record closes on the blink, and the *next* scrape carries
@@ -867,8 +943,26 @@ impl LiveRates {
                 } else {
                     stats.published_prompt
                 };
-                if span > 0 {
-                    adapter.note_span_size(span);
+                // The span and the staged pair travel on the same
+                // honesty: the ledger movement names one request only
+                // when exactly one completion crossed it, and a
+                // completion-edge close may carry the measured pair only
+                // when the window saw that completion. (Measured rates
+                // for a close whose window closed across *no* completion
+                // are someone else's: the churner's flood finishes a
+                // request every ~0.1s, and a window opened between two of
+                // its completions divides the tracked request's prefill
+                // steps by a slice of their span — the flood's 854,590
+                // t/s rows.)
+                self.span_tracked = d_count == 1.0 && pair_tracked;
+                if self.span_tracked && span > 0 {
+                    adapter.note_span_size(span, true);
+                } else if pair_tracked {
+                    // the window's own completion did land, but the
+                    // ledger also absorbed foreign publications: the
+                    // span is unnameable, the pair stays, the close falls
+                    // back to the live-gauge sum.
+                    adapter.note_span_size(0, false);
                 }
             } else if fresh > 0 {
                 // prefill lit, completion not yet seen: hold the live sum
@@ -879,9 +973,10 @@ impl LiveRates {
                 let sum = fresh + g.prefill_live.max(0.0) as u64;
                 if self.whole_span == 0 {
                     self.span_pre_open = self.prev_pre_total;
+                    self.span_tracked = true;
                 }
                 self.whole_span = sum;
-                adapter.note_span_size(sum);
+                adapter.note_span_size(sum, true);
             }
         }
         if stats.processing && self.prefill_total_lit > 0.0 {
@@ -1860,6 +1955,12 @@ mod tests {
         // the completion) over the baseline still in effect; the foreign-
         // movement veto watches the caches, and the success edge delivers
         // the close right here.
+        // The completion edge carries the whole span the engine will
+        // publish for A (2,805 = 500 tokens processed + 2,305 restored),
+        // noted by LiveRates' span ledger with the tracked flag: the
+        // adapter's window bracket (prompt_total moved only A's own 2,805;
+        // the flood rode cached_total) matches it exactly.
+        adapter.note_span_size(2805, true);
         adapter.note_measured_rates(Some(1402.0), Some(12.3), Some(1600.0 / 1402.0), 2805, 6);
         // The engine has moved its counters once more between scrapes and
         // a second request has completed: `succeeded` is ahead again, the

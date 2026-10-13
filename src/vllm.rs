@@ -285,6 +285,12 @@ pub struct VllmAdapter {
     /// by the engine's live gauges (fresh expectation + cache-restored
     /// live progress). Stamped on the close that names this request.
     pending_span_size: u64,
+    /// Whether `pending_span_size` names the in-flight request's prompt
+    /// whole (liveRates saw exactly one completion cross its ledger
+    /// span), and whether the measured-rate pendings describe the same
+    /// request. False under churn: a close then reads through the live
+    /// gauge memory only, not the counter window or the staged rates.
+    pending_span_tracked: bool,
     /// The whole-token counters' position as of the scrape *before* the
     /// in-flight request's admission (the last scrape that predates the
     /// adapter's baseline window for it). A completion that lands while
@@ -407,10 +413,21 @@ impl VllmAdapter {
     /// flight. Stamped on the next close the adapter builds for it, giving
     /// perf a span the completion's whole-counter ledger cannot outrun
     /// without having absorbed a foreign publication.
-    pub fn note_span_size(&mut self, whole_prompt: u64) {
+    pub fn note_span_size(&mut self, whole_prompt: u64, tracked: bool) {
         if whole_prompt == 0 {
+            // LiveRates has no nameable span for the request in flight
+            // (the ledger's movement straddled foreign publications):
+            // clear any held size so the next close reads the live-gauge
+            // fallback instead of a span that belongs to no one.
+            self.pending_span_size = 0;
+            self.pending_span_tracked = false;
             return;
         }
+        // A span note describes the request in flight: the measured-rate
+        // pendings staged alongside it (the same scrape stages both)
+        // describe that request only when the ledger movement saw exactly
+        // one completion — liveRates' honesty flag, carried here.
+        self.pending_span_tracked = tracked;
         if self.pending_span_size > 0 && whole_prompt != self.pending_span_size {
             // a different span is a different request — the engine names
             // each request's prompt whole at admission — so the old span
@@ -722,7 +739,39 @@ impl VllmAdapter {
                 // closed; this scrape's expectation (lit on the same
                 // scrape under continuous batching) opens the successor's
                 // window, so the span ledger starts blank for it.
+                let span_tracked = self.pending_span_tracked;
                 self.pending_span_size = 0;
+                self.pending_span_tracked = false;
+                // The counter window's spans and the staged measured pair
+                // describe one request only when the ledger moved under
+                // exactly one completion AND the live-rate window saw that
+                // completion. Under continuous batching the engine finishes
+                // foreign requests around the tracked one and their
+                // publications cross this window: the flood's 854,590 t/s
+                // rows divided a slice of the tracked request's prefill
+                // span by its whole published prompt. An untracked close
+                // carries no rates at all — and its spans fall back to the
+                // engine's admission-time memory, which no foreign
+                // completion can move (below).
+                if completed != 1 || !span_tracked {
+                    close.prefill_secs = None;
+                    close.measured_prefill_tps = None;
+                    close.measured_decode_tps = None;
+                    // ...and the pendings must go with them: the
+                    // blank-blank fallback below preserves pending rates
+                    // for the *next* edge, and an untracked pair must
+                    // never ride a later close either.
+                    self.pending_prefill_secs = None;
+                    self.pending_measured_rate = None;
+                    self.pending_measured_decode = None;
+                }
+                if completed != 1 && named_prompt > 0 && self.pending_in_flight {
+                    close.prompt = named_prompt;
+                    close.cached = close.cached.min(close.prompt);
+                    if close.gen == 0 {
+                        close.gen = std::mem::take(&mut self.pending_gen);
+                    }
+                }
                 let prev_span = (self.prev_prompt - self.edge_base_prompt).max(0.0);
                 let prev_gen = (self.prev_generation - self.edge_base_generation).max(0.0);
                 if completed == 1 && prev_span > 0.0 {
